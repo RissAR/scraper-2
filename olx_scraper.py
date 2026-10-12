@@ -212,6 +212,7 @@ class OLXScraper:
         self,
         limit: int = 40,
         max_retries: int = 3,
+        proxy: Optional[str] = None,
     ) -> list[ListingItem]:
         """
         Виконує прямий запит до OLX API з параметрами для 1-кімнатних квартир у Дніпрі.
@@ -234,8 +235,9 @@ class OLXScraper:
             "follow_redirects": True,
             "timeout": self.timeout,
         }
-        if self.proxy:
-            client_kwargs["proxy"] = self.proxy
+        active_proxy = proxy or self.proxy
+        if active_proxy:
+            client_kwargs["proxy"] = active_proxy
 
         for attempt in range(1, max_retries + 1):
             try:

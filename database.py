@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
-    """Асинхронний менеджер SQLite бази даних для збереження оголошень та підписників."""
+    """Асинхронний менеджер SQLite бази даних для збереження оголошень, підписників, проксі та стану бота."""
 
     def __init__(self, db_path: Path | str = settings.DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -60,8 +60,61 @@ class DatabaseManager:
                 );
                 """
             )
+
+            # Таблиця збережених проксі
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proxies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    response_time_ms REAL NOT NULL DEFAULT 0.0,
+                    last_checked TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+
+            # Таблиця системного стану бота (наприклад, активність моніторингу)
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """
+            )
+            # За замовчуванням моніторинг активний
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_state (key, value) VALUES ('monitoring_active', '1');"
+            )
+
             await db.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
+
+    # --- МЕТОДИ СТАНУ БОТА ---
+
+    async def get_monitoring_status(self) -> bool:
+        """Повертає True, якщо фоновий парсер запущено, і False, якщо на паузі."""
+        sql = "SELECT value FROM bot_state WHERE key = 'monitoring_active' LIMIT 1;"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql) as cur:
+                row = await cur.fetchone()
+                return row[0] == "1" if row else True
+
+    async def set_monitoring_status(self, is_active: bool) -> None:
+        """Оновлює стан фонового парсера."""
+        sql = """
+        INSERT INTO bot_state (key, value) VALUES ('monitoring_active', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        val_str = "1" if is_active else "0"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, (val_str,))
+            await db.commit()
+
+    # --- МЕТОДИ РОБОТИ З ОГОЛОШЕННЯМИ ---
 
     async def is_listing_seen(self, listing_id: str) -> bool:
         """Перевіряє, чи було оголошення вже зафіксоване в БД."""
@@ -146,6 +199,62 @@ class DatabaseManager:
         skipped = len(items) - added
         return added, skipped
 
+    async def get_listings(
+        self, limit: int = 1, offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """Повертає сторінку оголошень та загальну кількість записів для пагінації."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            # Загальна кількість
+            async with db.execute("SELECT COUNT(*) FROM seen_listings WHERE is_sent = 1;") as cur:
+                count_row = await cur.fetchone()
+                total = count_row[0] if count_row else 0
+
+            # Записи для поточної сторінки
+            query = """
+            SELECT id, source, external_id, title, price, currency, url, district, created_time, seen_at
+            FROM seen_listings
+            WHERE is_sent = 1
+            ORDER BY seen_at DESC
+            LIMIT ? OFFSET ?;
+            """
+            async with db.execute(query, (limit, offset)) as cur:
+                rows = await cur.fetchall()
+                items = [dict(r) for r in rows]
+
+            return items, total
+
+    async def get_recent_sent_listings(self, limit: int = 10) -> list[dict]:
+        """Повертає останні надіслані оголошення."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = """
+            SELECT id, source, external_id, title, price, currency, url, district, created_time, seen_at
+            FROM seen_listings
+            WHERE is_sent = 1
+            ORDER BY seen_at DESC
+            LIMIT ?;
+            """
+            async with db.execute(query, (limit,)) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_all_listings_for_export(self) -> list[dict]:
+        """Повертає всі збережені оголошення для експорту в Excel."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = """
+            SELECT id, source, external_id, title, price, currency, url, district, created_time, is_promoted, seen_at
+            FROM seen_listings
+            ORDER BY seen_at DESC;
+            """
+            async with db.execute(query) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    # --- МЕТОДИ ПІДПИСНИКІВ ---
+
     async def add_subscriber(
         self, chat_id: int, username: str = "", full_name: str = ""
     ) -> bool:
@@ -181,12 +290,73 @@ class DatabaseManager:
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
 
+    # --- МЕТОДИ КЕРУВАННЯ ПРОКСІ ---
+
+    async def add_proxy(self, url: str) -> bool:
+        """Додає новий проксі в базу."""
+        sql = """
+        INSERT OR IGNORE INTO proxies (url, is_active, status, response_time_ms, created_at)
+        VALUES (?, 1, 'unknown', 0.0, ?);
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(sql, (url.strip(), datetime.utcnow().isoformat()))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def delete_proxy(self, proxy_id: int) -> bool:
+        """Видаляє проксі за ID."""
+        sql = "DELETE FROM proxies WHERE id = ?;"
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(sql, (proxy_id,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def get_all_proxies(self) -> list[dict]:
+        """Повертає список усіх проксі."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM proxies ORDER BY id ASC;") as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def get_working_proxies(self) -> list[str]:
+        """Повертає список URL робочих активних проксі."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT url FROM proxies WHERE is_active = 1 AND status = 'active';"
+            async with db.execute(query) as cur:
+                rows = await cur.fetchall()
+                return [r["url"] for r in rows]
+
+    async def update_proxy_status(
+        self, proxy_id: int, status: str, response_time_ms: float
+    ) -> None:
+        """Оновлює результат перевірки проксі."""
+        sql = """
+        UPDATE proxies
+        SET status = ?, response_time_ms = ?, last_checked = ?
+        WHERE id = ?;
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                sql,
+                (
+                    status,
+                    response_time_ms,
+                    datetime.utcnow().isoformat(),
+                    proxy_id,
+                ),
+            )
+            await db.commit()
+
     async def get_stats(self) -> dict:
         """Отримує статистику роботи бази даних."""
         stats = {
             "total_seen": 0,
             "total_sent": 0,
             "active_subscribers": 0,
+            "proxies_count": 0,
+            "active_proxies_count": 0,
         }
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT COUNT(*) FROM seen_listings;") as cur:
@@ -203,5 +373,15 @@ class DatabaseManager:
                 row = await cur.fetchone()
                 if row:
                     stats["active_subscribers"] = row[0]
+
+            async with db.execute("SELECT COUNT(*) FROM proxies;") as cur:
+                row = await cur.fetchone()
+                if row:
+                    stats["proxies_count"] = row[0]
+
+            async with db.execute("SELECT COUNT(*) FROM proxies WHERE status = 'active';") as cur:
+                row = await cur.fetchone()
+                if row:
+                    stats["active_proxies_count"] = row[0]
 
         return stats
