@@ -188,18 +188,19 @@ def normalize_proxy_url(raw: str) -> str:
 
 def format_listing_message(item: ListingItem) -> str:
     """Форматування тексту повідомлення про оголошення від власника для стрічки."""
-    safe_title = html.escape(item.title)
-    safe_location = html.escape(item.location)
-    safe_price = html.escape(item.price_label or f"{int(item.price)} {item.currency}")
-    safe_source = html.escape(item.source)
-    author_info = html.escape(
+    safe_title = html.escape(str(item.title or ""))
+    safe_location = html.escape(str(item.location or ""))
+    safe_price = html.escape(str(item.price_label or f"{int(item.price)} {item.currency}"))
+    safe_source = html.escape(str(item.source or ""))
+    author_display = (
         f"{item.author_name} ({item.author_ads_count} ог.)"
         if item.author_name
         else "Власник"
     )
+    author_info = html.escape(author_display)
 
     phone_str = (
-        html.escape(item.phone)
+        html.escape(str(item.phone))
         if item.phone
         else "Не розкрито автоматично (перегляньте за посиланням нижче)"
     )
@@ -214,6 +215,8 @@ def format_listing_message(item: ListingItem) -> str:
     if item.total_area:
         params_parts.append(f"площа {item.total_area}")
     params_str = ", ".join(params_parts) if params_parts else "1 кімната"
+    safe_params = html.escape(params_str)
+    safe_url = html.escape(str(item.url or ""), quote=True)
 
     msg_lines = [
         f"🏠 <b>{safe_title}</b>",
@@ -222,35 +225,42 @@ def format_listing_message(item: ListingItem) -> str:
         f"📍 <b>Локація:</b> {safe_location}",
         f"👤 <b>Власник:</b> {author_info}",
         f"📞 <b>Телефон:</b> {phone_str}",
-        f"📐 <b>Параметри:</b> {html.escape(params_str)}",
+        f"📐 <b>Параметри:</b> {safe_params}",
         f"📌 <b>Джерело:</b> {safe_source}",
         "",
-        f'🔗 <a href="{item.url}">Переглянути на {safe_source}</a>',
+        f'🔗 <a href="{safe_url}">Переглянути на {safe_source}</a>',
     ]
     return "\n".join(msg_lines)
 
 
 def format_dict_listing_message(item: dict) -> str:
     """Форматування оголошення зі словника (з БД)."""
-    title = html.escape(item.get("title", "Без назви"))
+    title = html.escape(str(item.get("title") or "Без назви"))
     price = item.get("price", 0)
-    currency = item.get("currency", "грн")
-    district = html.escape(item.get("district") or "Не вказано")
-    url = item.get("url", "")
-    source = html.escape(item.get("source", "OLX.ua"))
-    author = html.escape(item.get("author_name") or "Власник")
+    currency = html.escape(str(item.get("currency") or "грн"))
+    district = html.escape(str(item.get("district") or "Не вказано"))
+    safe_url = html.escape(str(item.get("url") or ""), quote=True)
+    source = html.escape(str(item.get("source") or "OLX.ua"))
+    author = html.escape(str(item.get("author_name") or "Власник"))
     ads_cnt = item.get("author_ads_count", 1)
     raw_phone = item.get("phone")
     phone = (
-        html.escape(raw_phone)
+        html.escape(str(raw_phone))
         if raw_phone
         else "Не розкрито автоматично (перегляньте за посиланням нижче)"
     )
 
-    floor = item.get("floor")
-    total_floors = item.get("total_floors")
-    area = item.get("total_area")
-    floor_str = f"{floor}/{total_floors} пов." if floor and total_floors else ""
+    floor = str(item.get("floor") or "")
+    total_floors = str(item.get("total_floors") or "")
+    area = str(item.get("total_area") or "")
+    floor_str = f"{floor}/{total_floors} пов." if floor and total_floors else (f"{floor} пов." if floor else "")
+    params_parts = []
+    if floor_str:
+        params_parts.append(floor_str)
+    if area:
+        params_parts.append(f"площа {area}")
+    params_str = ", ".join(params_parts) if params_parts else "1 кімната"
+    safe_params = html.escape(params_str)
 
     return (
         f"🏠 <b>{title}</b>\n\n"
@@ -258,9 +268,9 @@ def format_dict_listing_message(item: dict) -> str:
         f"📍 <b>Район:</b> {district}\n"
         f"👤 <b>Власник:</b> {author} ({ads_cnt} ог.)\n"
         f"📞 <b>Телефон:</b> {phone}\n"
-        f"📐 <b>Параметри:</b> {floor_str} {area or ''}\n"
+        f"📐 <b>Параметри:</b> {safe_params}\n"
         f"📌 <b>Джерело:</b> {source}\n\n"
-        f'🔗 <a href="{url}">Переглянути оголошення</a>'
+        f'🔗 <a href="{safe_url}">Переглянути оголошення</a>'
     )
 
 
@@ -495,7 +505,11 @@ async def periodic_scanner_loop() -> None:
         except Exception as exc:
             logger.exception("Unexpected error in scanner loop: %s", exc)
 
-        await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
+        try:
+            await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("Background scanner loop cancelled during sleep.")
+            break
 
 
 # --- ТЕКСТИ МЕНЮ ТА КАБІНЕТІВ ---
@@ -532,9 +546,9 @@ async def get_admin_menu_text() -> str:
         f"🏢 <b>Панель управління RieltorBot (Адміністратор)</b>\n\n"
         f"• <b>OLX.ua парсер:</b> {olx_icon}\n"
         f"• <b>DIM.RIA парсер:</b> {dimria_icon}\n"
-        f"• <b>Місто:</b> {settings.CITY_NAME} (1-кімн. квартири)\n"
+        f"• <b>Місто:</b> {html.escape(str(settings.CITY_NAME))} (1-кімн. квартири)\n"
         f"• <b>Фільтр:</b> 🛡️ Тільки від ВЛАСНИКІВ\n"
-        f"• <b>Ціна:</b> {price_str}\n"
+        f"• <b>Ціна:</b> {html.escape(price_str)}\n"
         f"• <b>Райони:</b> {html.escape(excluded_str)}\n"
         f"• <b>Інтервал:</b> {settings.POLL_INTERVAL_SECONDS // 60} хв ({settings.POLL_INTERVAL_SECONDS} с)\n\n"
         f"📊 <b>Статистика:</b>\n"
@@ -552,7 +566,7 @@ def get_realtor_menu_text(full_name: str) -> str:
     return (
         f"🏠 <b>Кабінет Ріелтора — RieltorBot</b>\n\n"
         f"Вітаємо{greeting}!\n\n"
-        f"Тут відображаються актуальні 1-кімнатні квартири в оренду в м. {settings.CITY_NAME} "
+        f"Тут відображаються актуальні 1-кімнатні квартири в оренду в м. {html.escape(str(settings.CITY_NAME))} "
         f"<b>виключно від прямих власників</b>.\n\n"
         f"• <b>Оновлення бази:</b> кожні 2–4 хвилини у фоні\n"
         f"• <b>Джерела:</b> OLX.ua та DIM.RIA\n"
@@ -583,7 +597,7 @@ async def get_proxy_menu_text() -> tuple[str, bool]:
         elif status == "unknown":
             badge = "⚪ Не перевірено"
         else:
-            badge = f"🔴 {status}"
+            badge = f"🔴 {html.escape(str(status))}"
 
         masked_url = mask_proxy(p["url"])
         lines.append(f"{i}. <code>{html.escape(masked_url)}</code>\n   Статус: {badge}")
@@ -1126,6 +1140,13 @@ async def handle_make_admin(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "realtor_status")
 async def handle_realtor_status(callback: CallbackQuery) -> None:
     """Інформація про статус та підтримку для ріелтора."""
+    user_id = callback.from_user.id
+    if not settings.is_admin(user_id):
+        role = await db.get_user_role(user_id)
+        if role not in ("admin", "realtor"):
+            await callback.answer("⛔️ Ця дія доступна лише авторизованим користувачам!", show_alert=True)
+            return
+
     text = (
         "ℹ️ <b>Мій статус та технічна підтримка</b>\n\n"
         "• <b>Ваш статус:</b> 🟢 Авторизований Ріелтор\n"
@@ -1147,6 +1168,13 @@ async def handle_realtor_status(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "back_to_realtor")
 async def handle_back_to_realtor(callback: CallbackQuery) -> None:
     """Повернення до головного меню Кабінету Ріелтора."""
+    user_id = callback.from_user.id
+    if not settings.is_admin(user_id):
+        role = await db.get_user_role(user_id)
+        if role not in ("admin", "realtor"):
+            await callback.answer("⛔️ Ця дія доступна лише авторизованим користувачам!", show_alert=True)
+            return
+
     full_name = callback.from_user.full_name or ""
     text = get_realtor_menu_text(full_name)
     if callback.message:
@@ -1164,6 +1192,13 @@ async def handle_back_to_realtor(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("view_objects:"))
 async def handle_view_objects(callback: CallbackQuery) -> None:
     """Компактний перегляд збережених об'єктів з пагінацією."""
+    user_id = callback.from_user.id
+    if not settings.is_admin(user_id):
+        role = await db.get_user_role(user_id)
+        if role not in ("admin", "realtor"):
+            await callback.answer("⛔️ Ця дія доступна лише авторизованим користувачам!", show_alert=True)
+            return
+
     try:
         page_index = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
@@ -1176,26 +1211,32 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
         return
 
     item = items[0]
-    safe_title = html.escape(item.get("title", "Без назви"))
+    safe_title = html.escape(str(item.get("title") or "Без назви"))
     price = item.get("price", 0)
-    currency = item.get("currency", "грн")
-    district = html.escape(item.get("district") or "Не вказано")
+    currency = html.escape(str(item.get("currency") or "грн"))
+    district = html.escape(str(item.get("district") or "Не вказано"))
     url = item.get("url", "")
-    source = html.escape(item.get("source", "OLX.ua"))
-    created_val = str(item.get("created_time") or "")[:16].replace("T", " ")
-    seen_val = str(item.get("seen_at") or "")[:16].replace("T", " ")
+    source = html.escape(str(item.get("source") or "OLX.ua"))
+    created_val = html.escape(str(item.get("created_time") or "")[:16].replace("T", " "))
+    seen_val = html.escape(str(item.get("seen_at") or "")[:16].replace("T", " "))
 
-    author = html.escape(item.get("author_name") or "Власник")
+    author = html.escape(str(item.get("author_name") or "Власник"))
     ads_cnt = item.get("author_ads_count", 1)
-    phone = html.escape(item.get("phone") or "Не вказано / у чаті")
-    floor = item.get("floor")
-    total_floors = item.get("total_floors")
-    area = item.get("total_area")
+    raw_phone = item.get("phone")
+    phone = (
+        html.escape(str(raw_phone))
+        if raw_phone
+        else "Не вказано / у чаті"
+    )
+    floor = str(item.get("floor") or "")
+    total_floors = str(item.get("total_floors") or "")
+    area = str(item.get("total_area") or "")
     floor_str = (
         f"{floor}/{total_floors} пов."
         if floor and total_floors
         else (f"{floor} пов." if floor else "-")
     )
+    safe_floor_area = html.escape(f"{floor_str}, {area or '-'}")
 
     card_text = (
         f"📦 <b>Об'єкт #{page_index + 1} з {total} ({source})</b>\n\n"
@@ -1204,7 +1245,7 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
         f"📍 <b>Район:</b> {district}\n"
         f"👤 <b>Автор:</b> {author} ({ads_cnt} активних ог.)\n"
         f"📞 <b>Телефон:</b> {phone}\n"
-        f"📐 <b>Поверх / Площа:</b> {floor_str}, {area or '-'}\n"
+        f"📐 <b>Поверх / Площа:</b> {safe_floor_area}\n"
         f"📅 <b>Опубліковано:</b> {created_val or 'Невідомо'}\n"
         f"🕒 <b>Зафіксовано в базі:</b> {seen_val}\n"
     )
@@ -1236,6 +1277,13 @@ async def handle_noop(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("show_feed:"))
 async def handle_show_feed(callback: CallbackQuery) -> None:
     """Вивантажує нещодавно додані об'єкти стрічкою після кліку на сповіщення."""
+    user_id = callback.from_user.id
+    if not settings.is_admin(user_id):
+        role = await db.get_user_role(user_id)
+        if role not in ("admin", "realtor"):
+            await callback.answer("⛔️ Ця дія доступна лише авторизованим користувачам!", show_alert=True)
+            return
+
     try:
         count = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
@@ -1601,6 +1649,7 @@ async def process_cookies_input(message: Message, state: FSMContext) -> None:
 
 
 @dp.callback_query(F.data == "back_to_main")
+@dp.callback_query(F.data == "admin_menu")
 async def handle_back_to_main(callback: CallbackQuery, state: FSMContext) -> None:
     """Повернення в головне меню адміністратора."""
     await state.clear()
@@ -1630,7 +1679,7 @@ async def handle_back_to_main(callback: CallbackQuery, state: FSMContext) -> Non
 async def handle_show_status(callback: CallbackQuery) -> None:
     """Показ детального системного статусу."""
     if not await is_user_admin(callback.from_user.id):
-        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        await callback.answer("⛔️ Ця дія доступна лише адміністраторам!", show_alert=True)
         return
 
     stats = await db.get_stats()
@@ -1669,7 +1718,7 @@ async def handle_show_status(callback: CallbackQuery) -> None:
         f"• <b>Надіслано сповіщень:</b> {stats['total_sent']}\n"
         f"• <b>Користувачів у системі:</b> {len(users)}\n"
         f"• <b>Збережених проксі:</b> {stats['proxies_count']} (активних: {stats['active_proxies_count']})\n"
-        f"• <b>Місто:</b> {settings.CITY_NAME}\n"
+        f"• <b>Місто:</b> {html.escape(str(settings.CITY_NAME))}\n"
         f"• <b>Виключені райони:</b> {html.escape(excluded_str)}\n"
         f"• <b>Інтервал перевірки:</b> {settings.POLL_INTERVAL_SECONDS} сек.\n"
     )
@@ -1721,8 +1770,17 @@ async def main() -> None:
         logger.info("Starting Telegram Bot polling...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        logger.info("Initiating graceful shutdown...")
         scanner_task.cancel()
+        try:
+            await scanner_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Error awaiting scanner_task cancellation: %s", exc)
+
         await bot.session.close()
+        logger.info("Bot session closed successfully.")
         logger.info("Bot shutdown complete.")
 
 

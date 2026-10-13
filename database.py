@@ -22,6 +22,9 @@ class DatabaseManager:
         """Створює необхідні таблиці та індекси, якщо вони ще не існують."""
         logger.info("Initializing SQLite database at: %s", self.db_path)
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA journal_mode = WAL;")
+            await db.execute("PRAGMA busy_timeout = 5000;")
+
             # Таблиця для відстеження оброблених оголошень
             await db.execute(
                 """

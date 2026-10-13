@@ -54,7 +54,7 @@ def cookies_menu_keyboard(has_cookies: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Очистити Cookies", callback_data="clear_cookies"),
         ])
     buttons.append([
-        InlineKeyboardButton(text="« Назад у меню", callback_data="admin_menu"),
+        InlineKeyboardButton(text="« Назад у меню", callback_data="back_to_main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 

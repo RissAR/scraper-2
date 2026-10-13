@@ -21,8 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # Копіюємо вихідний код проекту
 COPY . .
 
-# Створюємо директорію для збереження бази даних
-RUN mkdir -p /app/data
+# Створюємо директорію для збереження бази даних та логів
+RUN mkdir -p /app/data && chmod 777 /app/data
 
 # Запуск бота
 CMD ["python", "bot.py"]
