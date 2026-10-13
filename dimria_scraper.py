@@ -525,6 +525,10 @@ class DimRiaScraper:
 
         # Запуск Playwright для нових ID
         verified_items: list[ListingItem] = []
+        browser = None
+        context = None
+        page = None
+
         try:
             async with async_playwright() as p:
                 launch_kwargs: dict[str, Any] = {
@@ -588,7 +592,10 @@ class DimRiaScraper:
 
                     for item_id in new_ids:
                         try:
-                            item = await self.fetch_listing_details_playwright(item_id, page)
+                            item = await asyncio.wait_for(
+                                self.fetch_listing_details_playwright(item_id, page),
+                                timeout=25.0,
+                            )
                             if item:
                                 verified_items.append(item)
                                 logger.info(
@@ -600,14 +607,36 @@ class DimRiaScraper:
                                 )
                             # Коротка пауза між сторінками
                             await asyncio.sleep(0.5)
+                        except asyncio.TimeoutError:
+                            logger.warning("Watchdog: DIM.RIA Playwright timed out (25s) for item %d", item_id)
                         except Exception as page_err:
                             logger.warning("Error processing DIM.RIA item %d: %s", item_id, page_err)
 
                 finally:
-                    await browser.close()
+                    if page and not page.is_closed():
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                    if browser:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
 
         except Exception as pw_err:
             logger.error("Playwright batch processing failed for DIM.RIA: %s", pw_err)
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
         logger.info(
             "DIM.RIA parsing complete: %d verified OWNER listings obtained out of %d candidates",

@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import random
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,7 @@ from keyboards import (
     back_to_menu_keyboard,
     back_to_realtor_keyboard,
     cancel_fsm_keyboard,
+    cookies_menu_keyboard,
     main_menu_keyboard,
     new_listings_notification_keyboard,
     pagination_keyboard,
@@ -58,6 +60,90 @@ scraper = olx_scraper
 
 class ProxyStates(StatesGroup):
     waiting_for_proxy_url = State()
+
+
+class CookieStates(StatesGroup):
+    waiting_for_cookies = State()
+
+
+# --- АВТОМАТИЧНИЙ ЗАПОБІЖНИК ТА АЛЕРТИ (CIRCUIT BREAKER & WATCHDOG) ---
+
+
+class ScraperCircuitBreaker:
+    """
+    Автоматичний запобіжник для парсерів (Circuit Breaker).
+    Фіксує послідовні збої, переводить скрапер у тимчасовий кулдаун (15 хв)
+    та відстежує стан надсилання сповіщень адміністратору.
+    """
+
+    def __init__(self, name: str, cooldown_minutes: int = 15, max_errors: int = 3) -> None:
+        self.name = name
+        self.cooldown_minutes = cooldown_minutes
+        self.max_errors = max_errors
+        self.consecutive_errors: int = 0
+        self.cooldown_until: Optional[datetime] = None
+        self.alert_sent: bool = False
+        self.last_error: str = ""
+
+    def is_in_cooldown(self) -> bool:
+        if self.cooldown_until:
+            now = datetime.now(timezone.utc)
+            if now < self.cooldown_until:
+                return True
+            self.cooldown_until = None
+        return False
+
+    def remaining_cooldown_minutes(self) -> int:
+        if self.cooldown_until:
+            diff = (self.cooldown_until - datetime.now(timezone.utc)).total_seconds()
+            return max(1, int(diff / 60))
+        return 0
+
+    def record_success(self) -> bool:
+        """Скидає лічильник помилок. Повертає True, якщо попередньо надсилався алерт про збій."""
+        was_alerted = self.alert_sent
+        self.consecutive_errors = 0
+        self.cooldown_until = None
+        self.alert_sent = False
+        self.last_error = ""
+        return was_alerted
+
+    def record_error(self, error_desc: str) -> bool:
+        """Реєструє критичну помилку. Повертає True, якщо досягнуто ліміт помилок і треба надіслати алерт."""
+        self.consecutive_errors += 1
+        self.last_error = str(error_desc)
+        if self.consecutive_errors >= self.max_errors:
+            self.cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=self.cooldown_minutes)
+            if not self.alert_sent:
+                self.alert_sent = True
+                return True
+        return False
+
+
+olx_circuit_breaker = ScraperCircuitBreaker("OLX.ua")
+dimria_circuit_breaker = ScraperCircuitBreaker("DIM.RIA")
+
+
+async def notify_admins(bot_instance: Bot, message: str) -> None:
+    """Надсилає системне сповіщення всім активним адміністраторам."""
+    admin_ids = set(settings.admin_id_list)
+    try:
+        users = await db.list_users()
+        for u in users:
+            if u.get("role") == "admin" and u.get("is_active"):
+                admin_ids.add(u["telegram_id"])
+    except Exception:
+        pass
+
+    for aid in admin_ids:
+        try:
+            await bot_instance.send_message(
+                chat_id=aid,
+                text=message,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Failed sending admin alert to %d: %s", aid, exc)
 
 
 # --- ДОПОМІЖНІ ФУНКЦІЇ БЕЗПЕКИ ТА ФОРМАТУВАННЯ ---
@@ -112,7 +198,11 @@ def format_listing_message(item: ListingItem) -> str:
         else "Власник"
     )
 
-    phone_str = html.escape(item.phone) if item.phone else f"<i>В описі / чаті {safe_source}</i>"
+    phone_str = (
+        html.escape(item.phone)
+        if item.phone
+        else "Не розкрито автоматично (перегляньте за посиланням нижче)"
+    )
     floor_info = (
         f"{item.floor}/{item.total_floors} пов."
         if item.floor and item.total_floors
@@ -150,7 +240,12 @@ def format_dict_listing_message(item: dict) -> str:
     source = html.escape(item.get("source", "OLX.ua"))
     author = html.escape(item.get("author_name") or "Власник")
     ads_cnt = item.get("author_ads_count", 1)
-    phone = html.escape(item.get("phone") or f"В описі / чаті {source}")
+    raw_phone = item.get("phone")
+    phone = (
+        html.escape(raw_phone)
+        if raw_phone
+        else "Не розкрито автоматично (перегляньте за посиланням нижче)"
+    )
 
     floor = item.get("floor")
     total_floors = item.get("total_floors")
@@ -224,29 +319,107 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
     sources_str = " + ".join(sources) if sources else "None"
     logger.info("Starting check cycle (%s)...", sources_str)
 
-    working_proxies = await db.get_working_proxies()
+    working_proxies = await db.get_active_proxies()
     active_proxy = random.choice(working_proxies) if working_proxies else None
 
     collected_items: list[ListingItem] = []
 
-    # 1. Опитування OLX.ua
+    # 1. Опитування OLX.ua з автоматичним Circuit Breaker та ротацією проксі
     if olx_active or manual_trigger_chat_id is not None:
-        try:
-            olx_items = await olx_scraper.fetch_listings(proxy=active_proxy)
-            collected_items.extend(olx_items)
-        except Exception as exc:
-            logger.error("OLX Scraper encountered an exception: %s", exc)
-
-    # 2. Опитування DIM.RIA
-    if (dimria_active or manual_trigger_chat_id is not None) and settings.DIMRIA_ENABLED:
-        try:
-            dimria_items = await dimria_scraper.fetch_listings(
-                proxy=active_proxy,
-                seen_checker=db.is_listing_seen,
+        if manual_trigger_chat_id is None and olx_circuit_breaker.is_in_cooldown():
+            logger.warning(
+                "OLX Scraper is in cooldown (%d min remaining). Skipping scheduled check.",
+                olx_circuit_breaker.remaining_cooldown_minutes(),
             )
-            collected_items.extend(dimria_items)
-        except Exception as exc:
-            logger.error("DIM.RIA Scraper encountered an exception: %s", exc)
+        else:
+            olx_items = None
+            candidate_proxies = [active_proxy] if active_proxy else []
+            if working_proxies:
+                for wp in working_proxies:
+                    if wp not in candidate_proxies:
+                        candidate_proxies.append(wp)
+            if not candidate_proxies:
+                candidate_proxies = [None]
+
+            last_olx_err = None
+            for p_candidate in candidate_proxies:
+                try:
+                    olx_items = await olx_scraper.fetch_listings(proxy=p_candidate)
+                    break
+                except Exception as exc:
+                    last_olx_err = exc
+                    logger.warning("OLX request with proxy %s failed: %s", mask_proxy(str(p_candidate)), exc)
+                    if len(candidate_proxies) > 1:
+                        await asyncio.sleep(1.0)
+
+            if olx_items is not None:
+                collected_items.extend(olx_items)
+                if olx_circuit_breaker.record_success():
+                    await notify_admins(
+                        bot,
+                        "✅ <b>РОБОТУ ВІДНОВЛЕНО:</b> Скрапер OLX.ua знову успішно отримує дані.",
+                    )
+            else:
+                err_msg = str(last_olx_err or "Помилка відповіді API")
+                logger.error("OLX Scraper encountered an exception: %s", err_msg)
+                should_alert = olx_circuit_breaker.record_error(err_msg)
+                if should_alert:
+                    alert_text = (
+                        f"⚠️ <b>УВАГА: Скрапер OLX.ua зафіксував 3 збої поспіль!</b>\n\n"
+                        f"Помилка: <code>{html.escape(err_msg[:200])}</code>\n\n"
+                        f"Скрапер тимчасово призупинено на 15 хв."
+                    )
+                    await notify_admins(bot, alert_text)
+
+    # 2. Опитування DIM.RIA з автоматичним Circuit Breaker та ротацією проксі
+    if (dimria_active or manual_trigger_chat_id is not None) and settings.DIMRIA_ENABLED:
+        if manual_trigger_chat_id is None and dimria_circuit_breaker.is_in_cooldown():
+            logger.warning(
+                "DIM.RIA Scraper is in cooldown (%d min remaining). Skipping scheduled check.",
+                dimria_circuit_breaker.remaining_cooldown_minutes(),
+            )
+        else:
+            dimria_items = None
+            candidate_proxies = [active_proxy] if active_proxy else []
+            if working_proxies:
+                for wp in working_proxies:
+                    if wp not in candidate_proxies:
+                        candidate_proxies.append(wp)
+            if not candidate_proxies:
+                candidate_proxies = [None]
+
+            last_dimria_err = None
+            for p_candidate in candidate_proxies:
+                try:
+                    dimria_items = await dimria_scraper.fetch_listings(
+                        proxy=p_candidate,
+                        seen_checker=db.is_listing_seen,
+                    )
+                    break
+                except Exception as exc:
+                    last_dimria_err = exc
+                    logger.warning("DIM.RIA request with proxy %s failed: %s", mask_proxy(str(p_candidate)), exc)
+                    if len(candidate_proxies) > 1:
+                        await asyncio.sleep(1.0)
+
+            if dimria_items is not None:
+                collected_items.extend(dimria_items)
+                if dimria_circuit_breaker.record_success():
+                    await notify_admins(
+                        bot,
+                        "✅ <b>РОБОТУ ВІДНОВЛЕНО:</b> Скрапер DIM.RIA знову успішно отримує дані.",
+                    )
+            else:
+                err_msg = str(last_dimria_err or "Помилка відповіді API")
+                logger.error("DIM.RIA Scraper encountered an exception: %s", err_msg)
+                should_alert = dimria_circuit_breaker.record_error(err_msg)
+                if should_alert:
+                    alert_text = (
+                        f"⚠️ <b>УВАГА: Скрапер DIM.RIA зафіксував 3 збої поспіль!</b>\n\n"
+                        f"Помилка: <code>{html.escape(err_msg[:200])}</code>\n\n"
+                        f"Скрапер тимчасово призупинено на 15 хв."
+                    )
+                    await notify_admins(bot, alert_text)
 
     if not collected_items:
         logger.info("No items retrieved in current cycle.")
@@ -1297,6 +1470,133 @@ async def handle_proxy_delete_item(callback: CallbackQuery) -> None:
         )
 
 
+# --- МЕНЮ СЕСІЙНИХ COOKIES OLX (HOT-RELOAD) ---
+
+
+@dp.message(Command("set_cookies"))
+async def cmd_set_cookies(message: Message, state: FSMContext) -> None:
+    """Команда швидкого оновлення сесійних cookies OLX без перезапуску бота."""
+    user_id = message.from_user.id if message.from_user else 0
+    if not await is_user_admin(user_id):
+        await message.answer("⛔️ Доступ заборонено.", parse_mode=ParseMode.HTML)
+        return
+
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) > 1 and "=" in parts[1]:
+        cookies_val = parts[1].strip()
+        await db.set_olx_cookies(cookies_val)
+        await state.clear()
+        await message.answer(
+            "✅ <b>Сесійні cookies OLX успішно збережено в базі даних!</b>\n\n"
+            "Нові cookies застосовано на льоту для всіх наступних запитів.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    await state.set_state(CookieStates.waiting_for_cookies)
+    await message.answer(
+        "🍪 <b>Встановлення сесійних cookies OLX</b>\n\n"
+        "Надішліть новий рядок cookies у форматі:\n"
+        "<code>name=val; name2=val2</code>\n\n"
+        "<i>Вони будуть збережені в SQLite та завантажуватимуться динамічно без перезапуску сервісу.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_fsm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "cookies_menu")
+async def handle_cookies_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    """Відображає меню керування сесійними cookies OLX."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    await state.clear()
+    cookies_val = await db.get_olx_cookies()
+    has_cookies = bool(cookies_val and cookies_val.strip())
+    if has_cookies:
+        preview = cookies_val[:30] + "..." if len(cookies_val) > 30 else cookies_val
+        status_text = f"🟢 <b>Встановлено:</b> <code>{html.escape(preview)}</code>\n• Довжина: {len(cookies_val)} симв."
+    else:
+        status_text = "⚪️ <b>Не встановлено</b> (використовується анонімний режим)"
+
+    text = (
+        "🍪 <b>Управління сесійними cookies OLX (Hot-Reload)</b>\n\n"
+        f"• <b>Поточний статус:</b> {status_text}\n\n"
+        "<i>Сесійні cookies дозволяють Playwright обходити антифрод-перевірки та розкривати приховані номери телефонів власників. "
+        "Оновлення відбувається миттєво без перезапуску бота.</i>"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=cookies_menu_keyboard(has_cookies),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "input_cookies")
+async def handle_input_cookies(callback: CallbackQuery, state: FSMContext) -> None:
+    """Запит на введення нового рядка cookies."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    await state.set_state(CookieStates.waiting_for_cookies)
+    text = (
+        "🍪 <b>Надішліть новий рядок cookies OLX:</b>\n\n"
+        "Формат: <code>name=val; name2=val2</code>\n\n"
+        "<i>Скопіюйте cookies з DevTools у вкладці Network при перегляді сайту OLX.</i>"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=cancel_fsm_keyboard()
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "clear_cookies")
+async def handle_clear_cookies(callback: CallbackQuery, state: FSMContext) -> None:
+    """Очищення збережених cookies."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    await db.set_olx_cookies("")
+    await callback.answer("Збережені cookies видалено!", show_alert=True)
+    await handle_cookies_menu(callback, state)
+
+
+@dp.message(CookieStates.waiting_for_cookies)
+async def process_cookies_input(message: Message, state: FSMContext) -> None:
+    """Обробка введеного рядка cookies."""
+    user_id = message.from_user.id if message.from_user else 0
+    if not await is_user_admin(user_id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text or "=" not in text:
+        await message.answer(
+            "⚠️ Некоректний формат cookies. Очікується рядок формату <code>name=val; name2=val2</code>.\n"
+            "Спробуйте ще раз або скасуйте дію:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_fsm_keyboard(),
+        )
+        return
+
+    await db.set_olx_cookies(text)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Сесійні cookies OLX успішно оновлено!</b>\n\n"
+        "Нові cookies збережено в SQLite та підключено на льоту.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+
 # --- НАВІГАЦІЯ ТА СИСТЕМНИЙ СТАТУС ---
 
 
@@ -1340,6 +1640,20 @@ async def handle_show_status(callback: CallbackQuery) -> None:
     olx_act = parsers.get("olx", True)
     dimria_act = parsers.get("dimria", True)
 
+    olx_cb_status = (
+        f"🔴 Кулдаун ({olx_circuit_breaker.remaining_cooldown_minutes()} хв)"
+        if olx_circuit_breaker.is_in_cooldown()
+        else (f"🟡 Збоїв: {olx_circuit_breaker.consecutive_errors}" if olx_circuit_breaker.consecutive_errors > 0 else "🟢 Норма")
+    )
+    dimria_cb_status = (
+        f"🔴 Кулдаун ({dimria_circuit_breaker.remaining_cooldown_minutes()} хв)"
+        if dimria_circuit_breaker.is_in_cooldown()
+        else (f"🟡 Збоїв: {dimria_circuit_breaker.consecutive_errors}" if dimria_circuit_breaker.consecutive_errors > 0 else "🟢 Норма")
+    )
+
+    cookies_val = await db.get_olx_cookies()
+    cookies_str = f"🟢 Встановлено ({len(cookies_val)} симв.)" if (cookies_val and cookies_val.strip()) else "⚪️ Не встановлено"
+
     excluded_str = (
         ", ".join(settings.excluded_districts)
         if settings.excluded_districts
@@ -1348,8 +1662,9 @@ async def handle_show_status(callback: CallbackQuery) -> None:
 
     text = (
         f"ℹ️ <b>Статус системи моніторингу RieltorBot</b>\n\n"
-        f"• <b>OLX.ua парсер:</b> {'🟢 Працює' if olx_act else '🔴 На паузі'}\n"
-        f"• <b>DIM.RIA парсер:</b> {'🟢 Працює' if dimria_act else '🔴 На паузі'}\n"
+        f"• <b>OLX.ua парсер:</b> {'🟢 Працює' if olx_act else '🔴 На паузі'} ({olx_cb_status})\n"
+        f"• <b>DIM.RIA парсер:</b> {'🟢 Працює' if dimria_act else '🔴 На паузі'} ({dimria_cb_status})\n"
+        f"• <b>Сесійні cookies OLX:</b> {cookies_str}\n"
         f"• <b>Всього збережено оголошень:</b> {stats['total_seen']}\n"
         f"• <b>Надіслано сповіщень:</b> {stats['total_sent']}\n"
         f"• <b>Користувачів у системі:</b> {len(users)}\n"

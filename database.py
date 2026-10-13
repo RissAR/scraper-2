@@ -151,6 +151,15 @@ class DatabaseManager:
                 """
             )
 
+            # Гарантоване призначення прав Адміністратора за ТЗ
+            await db.execute(
+                """
+                INSERT INTO users (telegram_id, username, full_name, role, is_active, created_at)
+                VALUES (123456789, 'admin', 'Admin', 'admin', 1, datetime('now'))
+                ON CONFLICT(telegram_id) DO UPDATE SET role = 'admin', is_active = 1;
+                """
+            )
+
             await db.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
 
@@ -213,6 +222,39 @@ class DatabaseManager:
             await db.execute(sql, ("dimria_active", val_str))
             await db.execute(sql, ("monitoring_active", val_str))
             await db.commit()
+
+    async def get_bot_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Отримує довільний текстовий параметр із таблиці bot_state."""
+        sql = "SELECT value FROM bot_state WHERE key = ? LIMIT 1;"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, (key,)) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else default
+
+    async def set_bot_setting(self, key: str, value: str) -> None:
+        """Зберігає довільний текстовий параметр у таблиці bot_state."""
+        sql = """
+        INSERT INTO bot_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, (key, value))
+            await db.commit()
+
+    async def get_olx_cookies(self) -> Optional[str]:
+        """Повертає збережені сесійні cookies OLX (або значення за замовчуванням із settings)."""
+        val = await self.get_bot_setting("olx_cookies")
+        if val and val.strip():
+            return val.strip()
+        return settings.OLX_COOKIES
+
+    async def set_olx_cookies(self, cookies: str) -> None:
+        """Зберігає оновлені cookies OLX у базі даних (Hot-Reload)."""
+        await self.set_bot_setting("olx_cookies", cookies.strip())
+
+    async def get_active_proxies(self) -> list[str]:
+        """Повертає список URL активних/робочих проксі для ротації."""
+        return await self.get_working_proxies()
 
     # --- МЕТОДИ РОБОТИ З ОГОЛОШЕННЯМИ ---
 
@@ -416,6 +458,9 @@ class DatabaseManager:
 
     async def get_user(self, telegram_id: int) -> Optional[dict]:
         """Отримує профіль користувача за його telegram_id."""
+        if settings.is_admin(telegram_id):
+            await self.get_user_role(telegram_id)
+
         sql = "SELECT * FROM users WHERE telegram_id = ? LIMIT 1;"
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -426,8 +471,19 @@ class DatabaseManager:
     async def get_user_role(self, telegram_id: int) -> Optional[str]:
         """
         Повертає роль користувача ('admin', 'realtor', 'pending') або 'deactivated'.
-        Якщо користувач не знайдений — повертає None.
+        Якщо telegram_id присутній у settings.admin_id_list, завжди повертає 'admin' та оновлює статус у БД.
         """
+        if settings.is_admin(telegram_id):
+            sql_admin = """
+            INSERT INTO users (telegram_id, username, full_name, role, is_active, created_at)
+            VALUES (?, 'admin', 'Admin', 'admin', 1, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET role = 'admin', is_active = 1;
+            """
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(sql_admin, (telegram_id, datetime.utcnow().isoformat()))
+                await db.commit()
+            return "admin"
+
         sql = "SELECT role, is_active FROM users WHERE telegram_id = ? LIMIT 1;"
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(sql, (telegram_id,)) as cur:
@@ -604,3 +660,7 @@ class DatabaseManager:
                     stats["active_proxies_count"] = row[0]
 
         return stats
+
+
+# Глобальний екземпляр бази даних
+db = DatabaseManager()

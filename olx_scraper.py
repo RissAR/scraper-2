@@ -181,42 +181,45 @@ class OLXScraper:
                 return f"+{digits}" if not phone_str.startswith("+") else phone_str
             return None
 
-        extracted_phone: Optional[str] = None
+        async def _extract_phone_playwright() -> Optional[str]:
+            extracted_phone: Optional[str] = None
+            browser = None
+            context = None
+            page = None
 
-        try:
-            async with async_playwright() as p:
-                launch_kwargs: dict[str, Any] = {
-                    "headless": True,
-                    "args": [
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                    "ignore_default_args": ["--enable-automation"],
-                }
+            try:
+                async with async_playwright() as p:
+                    launch_kwargs: dict[str, Any] = {
+                        "headless": True,
+                        "args": [
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-gpu",
+                            "--disable-blink-features=AutomationControlled",
+                        ],
+                        "ignore_default_args": ["--enable-automation"],
+                    }
 
-                # Підтримка активного проксі
-                active_proxy = proxy or self.proxy
-                if active_proxy:
-                    try:
-                        parsed_proxy = urlparse(active_proxy)
-                        proxy_dict: dict[str, str] = {
-                            "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
-                        }
-                        if parsed_proxy.username:
-                            proxy_dict["username"] = parsed_proxy.username
-                        if parsed_proxy.password:
-                            proxy_dict["password"] = parsed_proxy.password
-                        launch_kwargs["proxy"] = proxy_dict
-                    except Exception as p_err:
-                        logger.warning("Failed parsing proxy for Playwright: %s", p_err)
+                    # Підтримка активного проксі
+                    active_proxy = proxy or self.proxy
+                    if active_proxy:
+                        try:
+                            parsed_proxy = urlparse(active_proxy)
+                            proxy_dict: dict[str, str] = {
+                                "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
+                            }
+                            if parsed_proxy.username:
+                                proxy_dict["username"] = parsed_proxy.username
+                            if parsed_proxy.password:
+                                proxy_dict["password"] = parsed_proxy.password
+                            launch_kwargs["proxy"] = proxy_dict
+                        except Exception as p_err:
+                            logger.warning("Failed parsing proxy for Playwright: %s", p_err)
 
-                browser = await p.chromium.launch(**launch_kwargs)
-                try:
+                    browser = await p.chromium.launch(**launch_kwargs)
                     extra_headers = {
-                        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                        "sec-ch-ua": '"Google Chrome";v="128", "Chromium";v="128", "Not=A?Brand";v="24"',
                         "sec-ch-ua-mobile": "?0",
                         "sec-ch-ua-platform": '"Linux"',
                     }
@@ -233,21 +236,63 @@ class OLXScraper:
                         extra_http_headers=extra_headers,
                     )
 
+                    # Авторизація через OLX_COOKIES (гаряче оновлення з SQLite або з конфігурації)
+                    active_cookies_str = None
+                    try:
+                        from database import db
+                        active_cookies_str = await db.get_olx_cookies()
+                    except Exception:
+                        pass
+                    if not active_cookies_str:
+                        active_cookies_str = settings.OLX_COOKIES
+
+                    if active_cookies_str and active_cookies_str.strip():
+                        cookie_items = []
+                        for pair in active_cookies_str.split(";"):
+                            pair = pair.strip()
+                            if "=" in pair:
+                                c_key, c_val = pair.split("=", 1)
+                                cookie_items.append({
+                                    "name": c_key.strip(),
+                                    "value": c_val.strip(),
+                                    "domain": ".olx.ua",
+                                    "path": "/",
+                                })
+                        if cookie_items:
+                            try:
+                                await context.add_cookies(cookie_items)
+                                logger.debug("Added %d cookies to Playwright context", len(cookie_items))
+                            except Exception as c_err:
+                                logger.debug("Failed adding cookies: %s", c_err)
+
                     page = await context.new_page()
 
                     # Маскування автоматизації
                     try:
                         await page.add_init_script("""
                             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                            window.navigator.chrome = { runtime: {} };
+                            window.chrome = { runtime: {} };
+                            if (navigator.userAgentData) {
+                                Object.defineProperty(navigator, 'userAgentData', {
+                                    get: () => ({
+                                        brands: [
+                                            { brand: 'Google Chrome', version: '128' },
+                                            { brand: 'Chromium', version: '128' },
+                                            { brand: 'Not=A?Brand', version: '24' }
+                                        ],
+                                        mobile: false,
+                                        platform: 'Linux'
+                                    })
+                                });
+                            }
                         """)
                     except Exception:
                         pass
 
-                    # Блокування важких ресурсів: media, image, font, stylesheet
+                    # Блокування важких ресурсів: виключно media, image, font (стилі stylesheet обов'язково дозволені)
                     async def block_media_routes(route):
                         try:
-                            if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+                            if route.request.resource_type in ("image", "media", "font"):
                                 await route.abort()
                             else:
                                 await route.continue_()
@@ -256,15 +301,21 @@ class OLXScraper:
 
                     await page.route("**/*", block_media_routes)
 
-                    # Перехоплення limited-phones через network response
+                    # Перехоплення limited-phones через network response (Канал 1)
                     async def handle_response(response):
                         nonlocal extracted_phone
-                        if "limited-phones" in response.url:
+                        if "limited-phones" in response.url or "/phones" in response.url:
                             try:
                                 data = await response.json()
-                                phones = data.get("data", {}).get("phones", [])
-                                if not phones and isinstance(data.get("phones"), list):
-                                    phones = data.get("phones")
+                                phones = []
+                                if isinstance(data, dict):
+                                    d_data = data.get("data")
+                                    if isinstance(d_data, dict):
+                                        phones = d_data.get("phones", [])
+                                    elif isinstance(d_data, list):
+                                        phones = d_data
+                                    if not phones and "phones" in data:
+                                        phones = data.get("phones", [])
                                 if phones:
                                     for raw_p in phones:
                                         norm = _normalize(str(raw_p))
@@ -286,17 +337,18 @@ class OLXScraper:
                     # Безпечне закриття cookie-банера, якщо присутній
                     try:
                         cookie_btn = page.locator(
-                            'button[data-testid="accept-cookies"], button#onetrust-accept-btn-handler, button:has-text("Прийняти")'
+                            'button[data-testid="accept-cookies"], button#onetrust-accept-btn-handler, button:has-text("Прийняти"), button:has-text("Принять")'
                         ).first
-                        if await cookie_btn.is_visible(timeout=1000):
+                        if await cookie_btn.count() > 0 and await cookie_btn.is_visible(timeout=1000):
                             await cookie_btn.click(timeout=1000)
+                            await asyncio.sleep(0.5)
                     except Exception:
                         pass
 
-                    # Безпечний пошук кнопки розкриття телефону
+                    # Безпечний пошук кнопки розкриття телефону (перевірка всіх екземплярів селекторів)
                     button_selectors = [
                         'button[data-testid="show-phone"]',
-                        'button[data-testid="show-phone-button"]',
+                        'button[data-testid="ad-contact-phone"]',
                         'button[data-cy="ad-contact-phone"]',
                         '[data-testid="phones-container"] button',
                         'button:has-text("Показати")',
@@ -318,6 +370,23 @@ class OLXScraper:
                         except Exception:
                             continue
 
+                    if not phone_btn:
+                        try:
+                            await page.evaluate("window.scrollBy(0, 300)")
+                            await asyncio.sleep(0.5)
+                            for sel in button_selectors:
+                                loc = page.locator(sel)
+                                cnt = await loc.count()
+                                for i in range(cnt):
+                                    candidate = loc.nth(i)
+                                    if await candidate.is_visible(timeout=500):
+                                        phone_btn = candidate
+                                        break
+                                if phone_btn:
+                                    break
+                        except Exception:
+                            pass
+
                     # Безпечний клік по кнопці з багаторівневим fallback
                     if phone_btn:
                         try:
@@ -334,8 +403,8 @@ class OLXScraper:
                                 except Exception:
                                     pass
 
-                    # Очікування на оновлення відповіді мережі
-                    for _ in range(6):
+                    # Очікування на оновлення відповіді мережі або DOM (1-2 с)
+                    for _ in range(8):
                         if extracted_phone:
                             break
                         await asyncio.sleep(0.5)
@@ -357,10 +426,12 @@ class OLXScraper:
                         except Exception as dom_err:
                             logger.debug("Error checking tel: links in DOM: %s", dom_err)
 
-                    # Fallback 2: Перевірка тексту контейнера контактів
+                    # Fallback 2: Перевірка тексту контейнера контактів або кнопок (Канал 2)
                     if not extracted_phone:
                         try:
-                            container = page.locator('[data-testid="phones-container"], [data-testid="show-phone"]')
+                            container = page.locator(
+                                '[data-testid="phones-container"], [data-testid="show-phone"], [data-testid="ad-contact-phone"]'
+                            )
                             c_count = await container.count()
                             for i in range(c_count):
                                 text = await container.nth(i).inner_text()
@@ -372,14 +443,36 @@ class OLXScraper:
                                         break
                         except Exception as c_err:
                             logger.debug("Error checking container text: %s", c_err)
+            except Exception as exc:
+                logger.warning("Playwright on-demand phone extraction failed for %s: %s", target_url, exc)
+            finally:
+                if page and not page.is_closed():
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if context:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
 
-                finally:
-                    await browser.close()
+            return extracted_phone
 
+        # Watchdog: таймаут 25с на виконання екстракції Playwright
+        try:
+            return await asyncio.wait_for(_extract_phone_playwright(), timeout=25.0)
+        except asyncio.TimeoutError:
+            logger.warning("Watchdog: Playwright phone extraction timed out after 25s for %s", target_url)
+            return None
         except Exception as exc:
-            logger.warning("Playwright on-demand phone extraction failed for %s: %s", target_url, exc)
-
-        return extracted_phone
+            logger.warning("Watchdog caught unexpected error for %s: %s", target_url, exc)
+            return None
 
     def _parse_params(self, params_list: list) -> dict[str, Any]:
         """Парсить параметри квартири з сирого списку params."""
@@ -547,6 +640,13 @@ class OLXScraper:
         # 1. Спочатку перевіряємо, чи вказано відкритий номер у тексті (опис, заголовок, ім'я)
         combined_text = f"{title} {user_name} {description}"
         phone = self._extract_phone_from_text(combined_text)
+
+        # Перевіряємо контактні поля з API
+        if not phone:
+            contact = details.get("contact") or raw.get("contact") or {}
+            raw_phone = contact.get("phone") or contact.get("phone_number")
+            if raw_phone:
+                phone = self._extract_phone_from_text(str(raw_phone))
 
         # 2. Якщо в тексті немає телефону — запускаємо On-Demand Playwright екстрактор
         if not phone and url:

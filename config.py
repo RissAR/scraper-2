@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Опціональний токен авторизації OLX для витягування захищених номерів
     OLX_BEARER_TOKEN: Optional[str] = None
 
+    # Опціональні cookies OLX (рядок формату 'name=val; name2=val2')
+    OLX_COOKIES: Optional[str] = None
+
     # Налаштування DIM.RIA (dom.ria.com)
     DIMRIA_ENABLED: bool = True
     DIMRIA_STATE_ID: int = 11  # Дніпропетровська область

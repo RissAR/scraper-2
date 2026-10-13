@@ -35,10 +35,28 @@ def admin_main_keyboard(is_olx: bool, is_dimria: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🌐 Меню проксі", callback_data="proxy_menu"),
         ],
         [
+            InlineKeyboardButton(text="🍪 OLX Cookies", callback_data="cookies_menu"),
             InlineKeyboardButton(text="ℹ️ Системний статус", callback_data="show_status"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def cookies_menu_keyboard(has_cookies: bool) -> InlineKeyboardMarkup:
+    """Клавіатура керування сесійними cookies OLX."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="✏️ Встановити / Оновити Cookies", callback_data="input_cookies"),
+        ]
+    ]
+    if has_cookies:
+        buttons.append([
+            InlineKeyboardButton(text="🗑 Очистити Cookies", callback_data="clear_cookies"),
+        ])
+    buttons.append([
+        InlineKeyboardButton(text="« Назад у меню", callback_data="admin_menu"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def main_menu_keyboard(is_active: bool) -> InlineKeyboardMarkup:
