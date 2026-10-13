@@ -12,41 +12,47 @@ logger = logging.getLogger("test_olx")
 
 
 async def main() -> None:
-    logger.info("--- ЗАПУСК ТЕСТУ OLX SCRAPER ДЛЯ МІСТА ДНІПРО ---")
+    logger.info("--- ЗАПУСК ТЕСТУ ПОВНОГО СКРАПЕРА OLX (ТІЛЬКИ ВЛАСНИКИ ДНІПРО) ---")
     scraper = OLXScraper()
     items = await scraper.fetch_listings(limit=10)
 
-    print(f"\nОтримано валідних оголошень: {len(items)}")
-    assert len(items) > 0, "Помилка: не знайдено жодного оголошення на OLX!"
+    print(f"\nОтримано перевірених оголошень від власників: {len(items)}")
+    assert len(items) > 0, "Помилка: не знайдено жодного оголошення від власника на OLX!"
 
     db_manager = DatabaseManager(db_path="data/test_bot.db")
     await db_manager.init_db()
 
-    # Первинне збереження
+    # Первинне збереження в базу
     added, skipped = await db_manager.mark_listings_batch(items, is_sent=True)
     print(f"Перший прогін БД: додано нових = {added}, пропущено дублікатів = {skipped}")
 
-    # Повторне збереження тих самих оголошень (перевірка захисту від дублікатів)
+    # Перевірка захисту від дублікатів
     added_again, skipped_again = await db_manager.mark_listings_batch(items, is_sent=True)
-    print(
-        f"Повторний прогін БД: додано нових = {added_again}, "
-        f"пропущено дублікатів = {skipped_again}"
-    )
+    print(f"Повторний прогін БД: додано нових = {added_again}, пропущено дублікатів = {skipped_again}")
     assert added_again == 0, "Помилка: повторні оголошення не були визнані дублікатами!"
 
-    print("\n--- ПЕРШІ 3 ОГОЛОШЕННЯ ДЛЯ ПОВІДОМЛЕНЬ В TELEGRAM ---")
-    for i, it in enumerate(items[:3], start=1):
+    print("\n--- ДЕТАЛЬНИЙ ЗВІТ ПО ЗНАЙДЕНИХ ОБ'ЄКТАХ ВІД ВЛАСНИКІВ ---")
+    for i, it in enumerate(items[:5], start=1):
         print(f"\n[{i}] ID: {it.id}")
         print(f"Заголовок: {it.title}")
         print(f"Ціна: {it.price_label}")
-        print(f"Локація: {it.location} (Район: {it.district or 'Не вказано'})")
-        print(f"Джерело: {it.source}")
-        print(f"URL: {it.url}")
-        print(f"Фото: {it.image_url or 'Немає фото'}")
+        print(f"Локація: {it.location}")
+        print(f"👤 Власник: {it.author_name} (Активних оголошень: {it.author_ads_count})")
+        print(f"📞 Телефон: {it.phone or 'Не вказано у відкритому доступі'}")
+        print(f"📐 Параметри: поверх {it.floor or '?'}/{it.total_floors or '?'}, площа: {it.total_area or '?'}")
+        print(f"📷 Фотографій всього: {len(it.photos)}")
+        print(f"🔗 Посилання: {it.url}")
         print(f"Створено: {it.created_time}")
         print(f"Справді нове (< 48 год): {scraper.is_genuinely_new(it)}")
 
-    print("\n✅ ТЕСТ OLX SCRAPER УСПІШНО ПРОЙДЕНО!")
+    # Отримуємо з бази збережені дані для валідації
+    saved_items, total = await db_manager.get_listings(limit=5, offset=0)
+    print(f"\nПеревірка вибірки з БД: всього {total} записів, поля першого запису:")
+    if saved_items:
+        first = saved_items[0]
+        print(f"ID: {first['id']} | Власник: {first.get('author_name')} | Телефон: {first.get('phone')} | Площа: {first.get('total_area')}")
+
+    print("\n✅ ПОВНИЙ ТЕСТ OLX SCRAPER УСПІШНО ПРОЙДЕНО!")
 
 
 if __name__ == "__main__":

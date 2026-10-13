@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class ListingItem(BaseModel):
-    """Модель окремого оголошення про нерухомість."""
+    """Модель окремого оголошення про нерухомість з розширеними параметрами."""
 
     id: str = ""  # Унікальний складений ідентифікатор: 'olx:{external_id}'
     source: str = "OLX.ua"
@@ -19,6 +19,16 @@ class ListingItem(BaseModel):
     location: str = "м. Дніпро"
     url: str
     image_url: Optional[str] = None
+    photos: list[str] = []
+    description: Optional[str] = None
+    phone: Optional[str] = None
+    floor: Optional[str] = None
+    total_floors: Optional[str] = None
+    total_area: Optional[str] = None
+    kitchen_area: Optional[str] = None
+    author_name: Optional[str] = None
+    author_ads_count: int = 1
+    is_owner: bool = True
     created_time: Optional[datetime] = None
     last_refresh_time: Optional[datetime] = None
     is_promoted: bool = False

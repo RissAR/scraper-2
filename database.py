@@ -37,15 +37,49 @@ class DatabaseManager:
                     created_time TEXT,
                     is_promoted INTEGER NOT NULL DEFAULT 0,
                     is_sent INTEGER NOT NULL DEFAULT 1,
-                    seen_at TEXT NOT NULL
+                    seen_at TEXT NOT NULL,
+                    phone TEXT,
+                    description TEXT,
+                    floor TEXT,
+                    total_floors TEXT,
+                    total_area TEXT,
+                    kitchen_area TEXT,
+                    author_name TEXT,
+                    author_ads_count INTEGER NOT NULL DEFAULT 1,
+                    is_owner INTEGER NOT NULL DEFAULT 1
                 );
                 """
             )
+            # Перевірка та автоматичне додавання нових колонок, якщо таблиця вже існувала
+            async with db.execute("PRAGMA table_info(seen_listings);") as cur:
+                existing_cols = [row[1] for row in await cur.fetchall()]
+
+            additional_cols = {
+                "phone": "TEXT",
+                "description": "TEXT",
+                "floor": "TEXT",
+                "total_floors": "TEXT",
+                "total_area": "TEXT",
+                "kitchen_area": "TEXT",
+                "author_name": "TEXT",
+                "author_ads_count": "INTEGER NOT NULL DEFAULT 1",
+                "is_owner": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for col_name, col_type in additional_cols.items():
+                if col_name not in existing_cols:
+                    try:
+                        await db.execute(f"ALTER TABLE seen_listings ADD COLUMN {col_name} {col_type};")
+                    except Exception as col_err:
+                        logger.warning("Column %s could not be added: %s", col_name, col_err)
+
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seen_source ON seen_listings(source);"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seen_at ON seen_listings(seen_at);"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seen_is_owner ON seen_listings(is_owner);"
             )
 
             # Таблиця підписників (чатів / користувачів бота)
@@ -132,8 +166,10 @@ class DatabaseManager:
         sql = """
         INSERT OR IGNORE INTO seen_listings (
             id, source, external_id, title, price, currency,
-            url, district, created_time, is_promoted, is_sent, seen_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            url, district, created_time, is_promoted, is_sent, seen_at,
+            phone, description, floor, total_floors, total_area, kitchen_area,
+            author_name, author_ads_count, is_owner
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
             item.id,
@@ -148,6 +184,15 @@ class DatabaseManager:
             1 if item.is_promoted else 0,
             1 if is_sent else 0,
             datetime.utcnow().isoformat(),
+            item.phone,
+            item.description,
+            item.floor,
+            item.total_floors,
+            item.total_area,
+            item.kitchen_area,
+            item.author_name,
+            item.author_ads_count,
+            1 if item.is_owner else 0,
         )
 
         async with aiosqlite.connect(self.db_path) as db:
@@ -168,8 +213,10 @@ class DatabaseManager:
         sql = """
         INSERT OR IGNORE INTO seen_listings (
             id, source, external_id, title, price, currency,
-            url, district, created_time, is_promoted, is_sent, seen_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            url, district, created_time, is_promoted, is_sent, seen_at,
+            phone, description, floor, total_floors, total_area, kitchen_area,
+            author_name, author_ads_count, is_owner
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         now_iso = datetime.utcnow().isoformat()
         params_list = [
@@ -186,6 +233,15 @@ class DatabaseManager:
                 1 if item.is_promoted else 0,
                 1 if is_sent else 0,
                 now_iso,
+                item.phone,
+                item.description,
+                item.floor,
+                item.total_floors,
+                item.total_area,
+                item.kitchen_area,
+                item.author_name,
+                item.author_ads_count,
+                1 if item.is_owner else 0,
             )
             for item in items
         ]
@@ -213,7 +269,7 @@ class DatabaseManager:
 
             # Записи для поточної сторінки
             query = """
-            SELECT id, source, external_id, title, price, currency, url, district, created_time, seen_at
+            SELECT *
             FROM seen_listings
             WHERE is_sent = 1
             ORDER BY seen_at DESC
@@ -230,7 +286,7 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             query = """
-            SELECT id, source, external_id, title, price, currency, url, district, created_time, seen_at
+            SELECT *
             FROM seen_listings
             WHERE is_sent = 1
             ORDER BY seen_at DESC
@@ -245,7 +301,7 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             query = """
-            SELECT id, source, external_id, title, price, currency, url, district, created_time, is_promoted, seen_at
+            SELECT *
             FROM seen_listings
             ORDER BY seen_at DESC;
             """

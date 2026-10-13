@@ -75,20 +75,33 @@ def normalize_proxy_url(raw: str) -> str:
 
 
 def format_listing_message(item: ListingItem) -> str:
-    """Форматування тексту повідомлення про оголошення для стрічки."""
+    """Форматування тексту повідомлення про оголошення від власника для стрічки."""
     safe_title = html.escape(item.title)
     safe_location = html.escape(item.location)
     safe_price = html.escape(item.price_label or f"{int(item.price)} {item.currency}")
     safe_source = html.escape(item.source)
+    author_info = html.escape(f"{item.author_name} ({item.author_ads_count} ог.)" if item.author_name else "Власник")
+
+    phone_str = html.escape(item.phone) if item.phone else "<i>В описі / чаті OLX</i>"
+    floor_info = f"{item.floor}/{item.total_floors} пов." if item.floor and item.total_floors else (f"{item.floor} пов." if item.floor else None)
+    params_parts = []
+    if floor_info:
+        params_parts.append(floor_info)
+    if item.total_area:
+        params_parts.append(f"площа {item.total_area}")
+    params_str = ", ".join(params_parts) if params_parts else "1 кімната"
 
     msg_lines = [
         f"🏠 <b>{safe_title}</b>",
         "",
         f"💰 <b>Ціна:</b> {safe_price}",
-        f"📍 <b>Район/Локація:</b> {safe_location}",
+        f"📍 <b>Локація:</b> {safe_location}",
+        f"👤 <b>Власник:</b> {author_info}",
+        f"📞 <b>Телефон:</b> {phone_str}",
+        f"📐 <b>Параметри:</b> {html.escape(params_str)}",
         f"📌 <b>Джерело:</b> {safe_source}",
         "",
-        f'🔗 <a href="{item.url}">Переглянути оголошення на {safe_source}</a>',
+        f'🔗 <a href="{item.url}">Переглянути на {safe_source}</a>',
     ]
     return "\n".join(msg_lines)
 
@@ -101,11 +114,22 @@ def format_dict_listing_message(item: dict) -> str:
     district = html.escape(item.get("district") or "Не вказано")
     url = item.get("url", "")
     source = html.escape(item.get("source", "OLX.ua"))
+    author = html.escape(item.get("author_name") or "Власник")
+    ads_cnt = item.get("author_ads_count", 1)
+    phone = html.escape(item.get("phone") or "В описі / чаті OLX")
+
+    floor = item.get("floor")
+    total_floors = item.get("total_floors")
+    area = item.get("total_area")
+    floor_str = f"{floor}/{total_floors} пов." if floor and total_floors else ""
 
     return (
         f"🏠 <b>{title}</b>\n\n"
         f"💰 <b>Ціна:</b> {price:,.0f} {currency}\n"
         f"📍 <b>Район:</b> {district}\n"
+        f"👤 <b>Власник:</b> {author} ({ads_cnt} ог.)\n"
+        f"📞 <b>Телефон:</b> {phone}\n"
+        f"📐 <b>Параметри:</b> {floor_str} {area or ''}\n"
         f"📌 <b>Джерело:</b> {source}\n\n"
         f'🔗 <a href="{url}">Переглянути оголошення</a>'
     )
@@ -249,6 +273,7 @@ async def get_main_menu_text() -> str:
         f"🏢 <b>Панель управління RieltorBot (OLX Дніпро)</b>\n\n"
         f"• <b>Стан моніторингу:</b> {status_icon}\n"
         f"• <b>Місто:</b> {settings.CITY_NAME} (1-кімн. квартири)\n"
+        f"• <b>Фільтр продавця:</b> 🛡️ Тільки від ВЛАСНИКІВ (без ріелторів)\n"
         f"• <b>Ціновий діапазон:</b> {price_str}\n"
         f"• <b>Райони:</b> {html.escape(excluded_str)}\n"
         f"• <b>Інтервал опитування:</b> {settings.POLL_INTERVAL_SECONDS // 60} хв ({settings.POLL_INTERVAL_SECONDS} с)\n\n"
@@ -402,11 +427,22 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
     created_val = str(item.get("created_time") or "")[:16].replace("T", " ")
     seen_val = str(item.get("seen_at") or "")[:16].replace("T", " ")
 
+    author = html.escape(item.get("author_name") or "Власник")
+    ads_cnt = item.get("author_ads_count", 1)
+    phone = html.escape(item.get("phone") or "Не вказано / у чаті")
+    floor = item.get("floor")
+    total_floors = item.get("total_floors")
+    area = item.get("total_area")
+    floor_str = f"{floor}/{total_floors} пов." if floor and total_floors else (f"{floor} пов." if floor else "-")
+
     card_text = (
-        f"📦 <b>Об'єкт #{page_index + 1} з {total}</b>\n\n"
+        f"📦 <b>Об'єкт #{page_index + 1} з {total} (Власник)</b>\n\n"
         f"🏠 <b>{safe_title}</b>\n"
         f"💰 <b>Ціна:</b> {price:,.0f} {currency}\n"
         f"📍 <b>Район:</b> {district}\n"
+        f"👤 <b>Автор:</b> {author} ({ads_cnt} активних ог.)\n"
+        f"📞 <b>Телефон:</b> {phone}\n"
+        f"📐 <b>Поверх / Площа:</b> {floor_str}, {area or '-'}\n"
         f"📅 <b>Опубліковано:</b> {created_val or 'Невідомо'}\n"
         f"🕒 <b>Зафіксовано в базі:</b> {seen_val}\n"
     )

@@ -8,11 +8,12 @@ from openpyxl.utils import get_column_letter
 
 def export_listings_to_excel(listings: Sequence[dict[str, Any]]) -> bytes:
     """
-    Генерує Excel (.xlsx) файл із переліком оголошень з бази даних та повертає його байти.
+    Генерує розширений Excel (.xlsx) файл із переліком оголошень від власників
+    з бази даних та повертає його байти.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Оголошення Дніпро"
+    ws.title = "Власники Дніпро"
 
     # Заголовки стовпців
     headers = [
@@ -21,7 +22,12 @@ def export_listings_to_excel(listings: Sequence[dict[str, Any]]) -> bytes:
         "Заголовок",
         "Ціна",
         "Валюта",
+        "Телефон",
+        "Власник (Ім'я)",
+        "К-ть ог. в акаунта",
         "Район",
+        "Поверх",
+        "Площа",
         "Посилання (URL)",
         "Дата створення",
         "Реклама (ТОП)",
@@ -52,6 +58,7 @@ def export_listings_to_excel(listings: Sequence[dict[str, Any]]) -> bytes:
         created_val = str(item.get("created_time") or "")
         seen_val = str(item.get("seen_at") or "")
         is_promo = "Так" if item.get("is_promoted") else "Ні"
+        floor_str = f"{item.get('floor', '')}/{item.get('total_floors', '')}" if item.get('floor') else ""
 
         row_data = [
             item.get("id", ""),
@@ -59,7 +66,12 @@ def export_listings_to_excel(listings: Sequence[dict[str, Any]]) -> bytes:
             item.get("title", ""),
             item.get("price", 0.0),
             item.get("currency", "грн"),
+            item.get("phone") or "Не вказано",
+            item.get("author_name") or "Власник",
+            item.get("author_ads_count", 1),
             item.get("district") or "Не вказано",
+            floor_str,
+            item.get("total_area") or "",
             item.get("url", ""),
             created_val[:19].replace("T", " ") if created_val else "",
             is_promo,
@@ -71,7 +83,7 @@ def export_listings_to_excel(listings: Sequence[dict[str, Any]]) -> bytes:
         for col_idx in range(1, len(headers) + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
             cell.border = thin_border
-            if col_idx in (1, 2, 5, 9):
+            if col_idx in (1, 2, 5, 8, 10, 14):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             elif col_idx == 4:
                 cell.alignment = Alignment(horizontal="right", vertical="center")
