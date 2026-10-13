@@ -15,17 +15,24 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from config import settings
 from database import DatabaseManager
+from dimria_scraper import DimRiaScraper
 from exporter import export_listings_to_excel
 from keyboards import (
+    access_request_admin_keyboard,
+    admin_main_keyboard,
     back_to_menu_keyboard,
+    back_to_realtor_keyboard,
     cancel_fsm_keyboard,
     main_menu_keyboard,
     new_listings_notification_keyboard,
     pagination_keyboard,
     proxy_delete_keyboard,
     proxy_menu_keyboard,
+    realtor_main_keyboard,
+    unauthorized_keyboard,
+    user_detail_keyboard,
+    users_menu_keyboard,
 )
-from dimria_scraper import DimRiaScraper
 from models import ListingItem
 from olx_scraper import OLXScraper
 from proxy_checker import check_proxy_health
@@ -53,6 +60,17 @@ class ProxyStates(StatesGroup):
     waiting_for_proxy_url = State()
 
 
+# --- ДОПОМІЖНІ ФУНКЦІЇ БЕЗПЕКИ ТА ФОРМАТУВАННЯ ---
+
+
+async def is_user_admin(user_id: int) -> bool:
+    """Перевіряє, чи має користувач права адміністратора."""
+    if settings.is_admin(user_id):
+        return True
+    role = await db.get_user_role(user_id)
+    return role == "admin"
+
+
 def mask_proxy(url: str) -> str:
     """Маскує облікові дані в URL проксі для безпечного відображення."""
     if "@" in url:
@@ -72,7 +90,12 @@ def normalize_proxy_url(raw: str) -> str:
     if len(parts) == 4 and not text.startswith("http") and not text.startswith("socks"):
         host, port, user, password = parts
         return f"http://{user}:{password}@{host}:{port}"
-    if not (text.startswith("http://") or text.startswith("https://") or text.startswith("socks5://") or text.startswith("socks4://")):
+    if not (
+        text.startswith("http://")
+        or text.startswith("https://")
+        or text.startswith("socks5://")
+        or text.startswith("socks4://")
+    ):
         return f"http://{text}"
     return text
 
@@ -83,10 +106,18 @@ def format_listing_message(item: ListingItem) -> str:
     safe_location = html.escape(item.location)
     safe_price = html.escape(item.price_label or f"{int(item.price)} {item.currency}")
     safe_source = html.escape(item.source)
-    author_info = html.escape(f"{item.author_name} ({item.author_ads_count} ог.)" if item.author_name else "Власник")
+    author_info = html.escape(
+        f"{item.author_name} ({item.author_ads_count} ог.)"
+        if item.author_name
+        else "Власник"
+    )
 
-    phone_str = html.escape(item.phone) if item.phone else "<i>В описі / чаті OLX</i>"
-    floor_info = f"{item.floor}/{item.total_floors} пов." if item.floor and item.total_floors else (f"{item.floor} пов." if item.floor else None)
+    phone_str = html.escape(item.phone) if item.phone else f"<i>В описі / чаті {safe_source}</i>"
+    floor_info = (
+        f"{item.floor}/{item.total_floors} пов."
+        if item.floor and item.total_floors
+        else (f"{item.floor} пов." if item.floor else None)
+    )
     params_parts = []
     if floor_info:
         params_parts.append(floor_info)
@@ -152,7 +183,9 @@ async def send_listing_card(chat_id: int, item: ListingItem) -> bool:
                 )
                 return True
             except TelegramAPIError as exc:
-                logger.warning("Failed photo send for %s: %s. Using text fallback.", item.id, exc)
+                logger.warning(
+                    "Failed photo send for %s: %s. Using text fallback.", item.id, exc
+                )
 
         await bot.send_message(
             chat_id=chat_id,
@@ -166,34 +199,46 @@ async def send_listing_card(chat_id: int, item: ListingItem) -> bool:
         return False
 
 
+# --- ФОНОВИЙ МОНІТОРИНГ ТА РОЗДІЛЬНІ ПАРСЕРИ ---
+
+
 async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -> int:
     """
-    Один цикл перевірки наявності нових оголошень на OLX.ua та DIM.RIA.
+    Один цикл перевірки наявності нових оголошень на OLX.ua та DIM.RIA з урахуванням роздільних станів.
     При знаходженні нових об'єктів надсилає сповіщення з кнопкою 'Показати об'єкти'.
     """
-    is_active = await db.get_monitoring_status()
-    if not is_active and manual_trigger_chat_id is None:
-        logger.debug("Monitoring is paused. Skipping scheduled check.")
+    parsers = await db.get_parsers_state()
+    olx_active = parsers.get("olx", True)
+    dimria_active = parsers.get("dimria", True)
+
+    if manual_trigger_chat_id is None and not olx_active and not dimria_active:
+        logger.debug("Both parsers are paused. Skipping scheduled check.")
         return 0
 
-    sources_str = "OLX.ua + DIM.RIA" if settings.DIMRIA_ENABLED else "OLX.ua"
+    sources = []
+    if olx_active or manual_trigger_chat_id is not None:
+        sources.append("OLX.ua")
+    if (dimria_active or manual_trigger_chat_id is not None) and settings.DIMRIA_ENABLED:
+        sources.append("DIM.RIA")
+
+    sources_str = " + ".join(sources) if sources else "None"
     logger.info("Starting check cycle (%s)...", sources_str)
 
-    # Отримуємо робочий проксі за наявності
     working_proxies = await db.get_working_proxies()
     active_proxy = random.choice(working_proxies) if working_proxies else None
 
     collected_items: list[ListingItem] = []
 
     # 1. Опитування OLX.ua
-    try:
-        olx_items = await olx_scraper.fetch_listings(proxy=active_proxy)
-        collected_items.extend(olx_items)
-    except Exception as exc:
-        logger.error("OLX Scraper encountered an exception: %s", exc)
+    if olx_active or manual_trigger_chat_id is not None:
+        try:
+            olx_items = await olx_scraper.fetch_listings(proxy=active_proxy)
+            collected_items.extend(olx_items)
+        except Exception as exc:
+            logger.error("OLX Scraper encountered an exception: %s", exc)
 
     # 2. Опитування DIM.RIA
-    if settings.DIMRIA_ENABLED:
+    if (dimria_active or manual_trigger_chat_id is not None) and settings.DIMRIA_ENABLED:
         try:
             dimria_items = await dimria_scraper.fetch_listings(
                 proxy=active_proxy,
@@ -224,18 +269,20 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
 
         await db.mark_listing_seen(item, is_sent=True)
         new_items.append(item)
-        logger.info("New listing registered: [%s] %s (%s)", item.id, item.title, item.price_label)
+        logger.info(
+            "New listing registered: [%s] %s (%s)", item.id, item.title, item.price_label
+        )
 
     new_count = len(new_items)
     logger.info("Check finished. New listings detected: %d", new_count)
 
-    active_subs = await db.get_active_subscribers()
-    configured_chats = settings.target_chat_ids
-    recipients = sorted(list(set(active_subs + configured_chats)))
+    active_recipients = await db.get_active_recipients()
+    configured_chats = settings.target_chat_ids + settings.admin_id_list
+    recipients = sorted(list(set(active_recipients + configured_chats)))
     if manual_trigger_chat_id and manual_trigger_chat_id not in recipients:
         recipients.append(manual_trigger_chat_id)
 
-    # Якщо знайдено нові об'єкти, надсилаємо сповіщення згідно з ТЗ
+    # Якщо знайдено нові об'єкти, надсилаємо сповіщення
     if new_count > 0 and recipients:
         notify_text = (
             f"✅ <b>Парсинг завершено успішно, об'єктів додано: {new_count}</b>\n\n"
@@ -252,6 +299,7 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
                     reply_markup=kb,
                 )
             except TelegramForbiddenError:
+                await db.set_user_status(cid, False)
                 await db.remove_subscriber(cid)
             except Exception as err:
                 logger.error("Failed sending notification to %d: %s", cid, err)
@@ -261,8 +309,10 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
 
 async def periodic_scanner_loop() -> None:
     """Фонова задача періодичного опитування OLX та DIM.RIA у реальному часі."""
-    sources_str = "OLX.ua + DIM.RIA" if settings.DIMRIA_ENABLED else "OLX.ua"
-    logger.info("Background scanner loop initialized (interval: %d s, sources: %s).", settings.POLL_INTERVAL_SECONDS, sources_str)
+    logger.info(
+        "Background scanner loop initialized (interval: %d s).",
+        settings.POLL_INTERVAL_SECONDS,
+    )
     while True:
         try:
             await check_for_new_listings()
@@ -275,17 +325,29 @@ async def periodic_scanner_loop() -> None:
         await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
 
 
-# --- ТЕКСТИ МЕНЮ ---
+# --- ТЕКСТИ МЕНЮ ТА КАБІНЕТІВ ---
 
 
-async def get_main_menu_text() -> str:
-    """Генерує актуальний текст головного меню."""
-    is_active = await db.get_monitoring_status()
+async def get_admin_menu_text() -> str:
+    """Генерує актуальний текст головного меню адміністратора."""
+    parsers = await db.get_parsers_state()
+    olx_act = parsers.get("olx", True)
+    dimria_act = parsers.get("dimria", True)
+
+    olx_icon = "🟢 АКТИВНИЙ" if olx_act else "🔴 ЗУПИНЕНО"
+    dimria_icon = "🟢 АКТИВНИЙ" if dimria_act else "🔴 ЗУПИНЕНО"
+
     stats = await db.get_stats()
-    status_icon = "🟢 АКТИВНИЙ" if is_active else "⏸ НА ПАУЗІ"
+    users = await db.list_users()
+    realtors_cnt = sum(
+        1 for u in users if u.get("role") == "realtor" and u.get("is_active")
+    )
+    pending_cnt = sum(1 for u in users if u.get("role") == "pending")
 
     excluded_str = (
-        ", ".join(settings.excluded_districts) if settings.excluded_districts else "Усі райони"
+        ", ".join(settings.excluded_districts)
+        if settings.excluded_districts
+        else "Усі райони"
     )
     price_str = (
         f"{settings.MIN_PRICE or 0:,.0f} - {settings.MAX_PRICE or '∞'} грн"
@@ -294,18 +356,35 @@ async def get_main_menu_text() -> str:
     )
 
     return (
-        f"🏢 <b>Панель управління RieltorBot (OLX Дніпро)</b>\n\n"
-        f"• <b>Стан моніторингу:</b> {status_icon}\n"
+        f"🏢 <b>Панель управління RieltorBot (Адміністратор)</b>\n\n"
+        f"• <b>OLX.ua парсер:</b> {olx_icon}\n"
+        f"• <b>DIM.RIA парсер:</b> {dimria_icon}\n"
         f"• <b>Місто:</b> {settings.CITY_NAME} (1-кімн. квартири)\n"
-        f"• <b>Фільтр продавця:</b> 🛡️ Тільки від ВЛАСНИКІВ (без ріелторів)\n"
-        f"• <b>Ціновий діапазон:</b> {price_str}\n"
+        f"• <b>Фільтр:</b> 🛡️ Тільки від ВЛАСНИКІВ\n"
+        f"• <b>Ціна:</b> {price_str}\n"
         f"• <b>Райони:</b> {html.escape(excluded_str)}\n"
-        f"• <b>Інтервал опитування:</b> {settings.POLL_INTERVAL_SECONDS // 60} хв ({settings.POLL_INTERVAL_SECONDS} с)\n\n"
-        f"📊 <b>Статистика бази:</b>\n"
-        f"• Всього відстежено: <b>{stats['total_seen']}</b>\n"
+        f"• <b>Інтервал:</b> {settings.POLL_INTERVAL_SECONDS // 60} хв ({settings.POLL_INTERVAL_SECONDS} с)\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• Відстежено оголошень: <b>{stats['total_seen']}</b>\n"
         f"• Сповіщень відправлено: <b>{stats['total_sent']}</b>\n"
+        f"• Користувачі: <b>{len(users)}</b> (активних ріелторів: {realtors_cnt}, очікують: {pending_cnt})\n"
         f"• Проксі в базі: <b>{stats['proxies_count']}</b> (активних: {stats['active_proxies_count']})\n\n"
         f"Оберіть потрібну дію нижче:"
+    )
+
+
+def get_realtor_menu_text(full_name: str) -> str:
+    """Генерує вітальний текст Кабінету Ріелтора."""
+    greeting = f", {html.escape(full_name)}" if full_name else ""
+    return (
+        f"🏠 <b>Кабінет Ріелтора — RieltorBot</b>\n\n"
+        f"Вітаємо{greeting}!\n\n"
+        f"Тут відображаються актуальні 1-кімнатні квартири в оренду в м. {settings.CITY_NAME} "
+        f"<b>виключно від прямих власників</b>.\n\n"
+        f"• <b>Оновлення бази:</b> кожні 2–4 хвилини у фоні\n"
+        f"• <b>Джерела:</b> OLX.ua та DIM.RIA\n"
+        f"• <b>Фільтрація:</b> автоблокування посередників та ріелторів\n\n"
+        f"Оберіть дію нижче:"
     )
 
 
@@ -340,89 +419,570 @@ async def get_proxy_menu_text() -> tuple[str, bool]:
     return "\n".join(lines), True
 
 
-# --- ОБРОБНИКИ КОМАНД ТА КНОПОК ---
+# --- ОБРОБНИКИ КОМАНД (/start, /menu) ---
 
 
 @dp.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext) -> None:
-    """Команда /start: реєстрація користувача та показ головного інлайн-меню."""
+    """Команда /start: перевірка прав, реєстрація та показ відповідного кабінету."""
     await state.clear()
-    chat_id = message.chat.id
-    username = message.from_user.username or "" if message.from_user else ""
-    full_name = message.from_user.full_name if message.from_user else ""
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    username = (message.from_user.username or "") if message.from_user else ""
+    full_name = (message.from_user.full_name or "") if message.from_user else ""
 
-    await db.add_subscriber(chat_id=chat_id, username=username, full_name=full_name)
-    is_active = await db.get_monitoring_status()
-    text = await get_main_menu_text()
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(is_active))
+    # Перевіряємо статус адміна
+    if settings.is_admin(user_id):
+        await db.add_user(
+            telegram_id=user_id,
+            username=username,
+            full_name=full_name,
+            role="admin",
+            is_active=True,
+        )
+        parsers = await db.get_parsers_state()
+        kb = admin_main_keyboard(parsers.get("olx", True), parsers.get("dimria", True))
+        text = await get_admin_menu_text()
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    # Перевіряємо статус користувача в базі
+    user = await db.get_user(user_id)
+    if not user:
+        text = (
+            "🔒 <b>Доступ закрито</b>\n\n"
+            "Цей бот призначений виключно для авторизованих ріелторів та адміністраторів.\n\n"
+            "Натисніть кнопку нижче, щоб надіслати запит на отримання доступу:"
+        )
+        await message.answer(
+            text, parse_mode=ParseMode.HTML, reply_markup=unauthorized_keyboard(user_id)
+        )
+        return
+
+    role = user.get("role", "pending")
+    is_active = bool(user.get("is_active", 1))
+
+    if not is_active:
+        await message.answer(
+            "⛔️ <b>Ваш акаунт деактивовано або заблоковано адміністратором.</b>\n"
+            "Для відновлення зверніться до технічної підтримки.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if role == "admin":
+        parsers = await db.get_parsers_state()
+        kb = admin_main_keyboard(parsers.get("olx", True), parsers.get("dimria", True))
+        text = await get_admin_menu_text()
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif role == "realtor":
+        text = get_realtor_menu_text(full_name)
+        await message.answer(
+            text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
+        )
+    else:  # 'pending'
+        await message.answer(
+            "⏳ <b>Ваш запит на доступ очікує розгляду адміністратора.</b>\n\n"
+            "Як тільки доступ буде схвалено, ви отримаєте сповіщення.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @dp.message(Command("menu"))
 async def handle_menu_command(message: Message, state: FSMContext) -> None:
-    """Команда /menu: відкриває головне меню."""
+    """Команда /menu: відкриває меню відповідно до ролі користувача."""
     await state.clear()
-    is_active = await db.get_monitoring_status()
-    text = await get_main_menu_text()
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(is_active))
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if await is_user_admin(user_id):
+        parsers = await db.get_parsers_state()
+        kb = admin_main_keyboard(parsers.get("olx", True), parsers.get("dimria", True))
+        text = await get_admin_menu_text()
+        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
 
-
-# --- ПЕРЕМИКАННЯ СТАНУ ПАРСЕРА (СТАРТ / СТОП) ---
-
-
-@dp.callback_query(F.data == "monitoring_pause")
-async def handle_monitoring_pause(callback: CallbackQuery) -> None:
-    """Зупинка періодичного фонового парсера."""
-    await db.set_monitoring_status(False)
-    await callback.answer("⏸ Моніторинг зупинено!", show_alert=False)
-    text = await get_main_menu_text()
-    if callback.message:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(False)
+    user = await db.get_user(user_id)
+    if user and user.get("role") == "realtor" and user.get("is_active"):
+        full_name = message.from_user.full_name if message.from_user else ""
+        text = get_realtor_menu_text(full_name)
+        await message.answer(
+            text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
         )
-
-
-@dp.callback_query(F.data == "monitoring_start")
-async def handle_monitoring_start(callback: CallbackQuery) -> None:
-    """Запуск періодичного фонового парсера."""
-    await db.set_monitoring_status(True)
-    await callback.answer("▶️ Моніторинг активовано!", show_alert=False)
-    text = await get_main_menu_text()
-    if callback.message:
-        await callback.message.edit_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(True)
-        )
-
-
-# --- РУЧНИЙ ЗАПУСК ПЕРЕВІРКИ ---
-
-
-@dp.callback_query(F.data == "manual_check")
-async def handle_manual_check(callback: CallbackQuery) -> None:
-    """Ручний запуск циклу парсингу OLX."""
-    await callback.answer("🔍 Запускаю перевірку OLX...")
-    if callback.message:
-        await callback.message.edit_text(
-            "⏳ <b>Виконується пошук свіжих оголошень на OLX.ua...</b>",
+    else:
+        await message.answer(
+            "🔒 <b>Доступ закрито.</b> Натисніть /start для реєстрації або перевірки статусу.",
             parse_mode=ParseMode.HTML,
         )
 
-    new_found = await check_for_new_listings(manual_trigger_chat_id=callback.from_user.id)
-    is_active = await db.get_monitoring_status()
-    menu_kb = main_menu_keyboard(is_active)
 
-    if new_found == 0:
-        result_text = (
-            "✅ <b>Парсинг завершено!</b>\n\n"
-            "Нових оголошень на цей момент не виявлено.\n"
-            "Усі існуючі оголошення вже оброблено."
+# --- ПЕРЕМИКАННЯ СТАНУ ПАРСЕРІВ (АДМІН) ---
+
+
+@dp.callback_query(F.data == "toggle_olx")
+async def handle_toggle_olx(callback: CallbackQuery) -> None:
+    """Перемикання стану парсера OLX.ua."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    parsers = await db.get_parsers_state()
+    curr_olx = parsers.get("olx", True)
+    new_olx = not curr_olx
+    await db.set_parser_state("olx", new_olx)
+
+    status_str = "активовано 🟢" if new_olx else "зупинено 🔴"
+    await callback.answer(f"OLX.ua парсер {status_str}!", show_alert=False)
+
+    text = await get_admin_menu_text()
+    kb = admin_main_keyboard(is_olx=new_olx, is_dimria=parsers.get("dimria", True))
+    if callback.message:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "toggle_dimria")
+async def handle_toggle_dimria(callback: CallbackQuery) -> None:
+    """Перемикання стану парсера DIM.RIA."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    parsers = await db.get_parsers_state()
+    curr_dimria = parsers.get("dimria", True)
+    new_dimria = not curr_dimria
+    await db.set_parser_state("dimria", new_dimria)
+
+    status_str = "активовано 🟢" if new_dimria else "зупинено 🔴"
+    await callback.answer(f"DIM.RIA парсер {status_str}!", show_alert=False)
+
+    text = await get_admin_menu_text()
+    kb = admin_main_keyboard(is_olx=parsers.get("olx", True), is_dimria=new_dimria)
+    if callback.message:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "toggle_all")
+async def handle_toggle_all(callback: CallbackQuery) -> None:
+    """Перемикання стану всіх парсерів одночасно."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    parsers = await db.get_parsers_state()
+    both_active = parsers.get("olx", True) and parsers.get("dimria", True)
+    new_state = not both_active
+    await db.set_all_parsers_state(new_state)
+
+    status_str = "активовано 🟢" if new_state else "зупинено 🔴"
+    await callback.answer(f"Усі парсери {status_str}!", show_alert=False)
+
+    text = await get_admin_menu_text()
+    kb = admin_main_keyboard(is_olx=new_state, is_dimria=new_state)
+    if callback.message:
+        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# --- РАЗОВІ ТЕСТИ ПАРСЕРІВ (1 КОЛО) ---
+
+
+@dp.callback_query(F.data == "test_olx_now")
+async def handle_test_olx_now(callback: CallbackQuery) -> None:
+    """Разове тестове коло OLX для швидкої діагностики."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    await callback.answer("🔍 Запускаю тестовий цикл OLX...")
+    if callback.message:
+        await callback.message.edit_text(
+            "⏳ <b>Виконується тестовий запит до OLX.ua (1 коло)...</b>\n"
+            "<i>Опитування першої сторінки та перевірка фільтрації власників.</i>",
+            parse_mode=ParseMode.HTML,
         )
-        if callback.message:
-            await callback.message.edit_text(result_text, parse_mode=ParseMode.HTML, reply_markup=menu_kb)
-    else:
-        # Сповіщення вже відправлено функцією check_for_new_listings
-        text = await get_main_menu_text()
-        if callback.message:
-            await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=menu_kb)
+
+    working_proxies = await db.get_working_proxies()
+    active_proxy = random.choice(working_proxies) if working_proxies else None
+
+    try:
+        items = await olx_scraper.fetch_listings(proxy=active_proxy, limit=20)
+        new_count = 0
+        for it in items:
+            if not await db.is_listing_seen(it.id):
+                new_count += 1
+
+        proxy_str = mask_proxy(active_proxy) if active_proxy else "Пряме з'єднання"
+        report_text = (
+            "🔍 <b>Результати тесту OLX.ua (1 коло):</b>\n\n"
+            f"• Статус запиту: 🟢 <b>Успішно</b>\n"
+            f"• Знайдено від власників: <b>{len(items)}</b> об'єктів\n"
+            f"• Нових (немає в базі): <b>{new_count}</b> об'єктів\n"
+            f"• Використано проксі: <code>{html.escape(proxy_str)}</code>\n\n"
+            "<i>Парсер готовий до автоматичної роботи.</i>"
+        )
+    except Exception as exc:
+        logger.exception("Test OLX failed: %s", exc)
+        report_text = (
+            "❌ <b>Помилка під час тесту OLX.ua!</b>\n\n"
+            f"Деталі помилки: <code>{html.escape(str(exc))}</code>"
+        )
+
+    if callback.message:
+        await callback.message.edit_text(
+            report_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+
+
+@dp.callback_query(F.data == "test_dimria_now")
+async def handle_test_dimria_now(callback: CallbackQuery) -> None:
+    """Разове тестове коло DIM.RIA для швидкої діагностики."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    await callback.answer("🔍 Запускаю тестовий цикл DIM.RIA...")
+    if callback.message:
+        await callback.message.edit_text(
+            "⏳ <b>Виконується тестовий запит до DIM.RIA (1 коло)...</b>\n"
+            "<i>Опитування searchEngine/v2 та перевірка карток власників.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    working_proxies = await db.get_working_proxies()
+    active_proxy = random.choice(working_proxies) if working_proxies else None
+
+    try:
+        items = await dimria_scraper.fetch_listings(
+            proxy=active_proxy,
+            limit=10,
+            seen_checker=db.is_listing_seen,
+        )
+        new_count = 0
+        for it in items:
+            if not await db.is_listing_seen(it.id):
+                new_count += 1
+
+        proxy_str = mask_proxy(active_proxy) if active_proxy else "Пряме з'єднання"
+        report_text = (
+            "🔍 <b>Результати тесту DIM.RIA (1 коло):</b>\n\n"
+            f"• Статус запиту: 🟢 <b>Успішно</b>\n"
+            f"• Знайдено від власників: <b>{len(items)}</b> об'єктів\n"
+            f"• Нових (немає в базі): <b>{new_count}</b> об'єктів\n"
+            f"• Використано проксі: <code>{html.escape(proxy_str)}</code>\n\n"
+            "<i>Парсер готовий до автоматичної роботи.</i>"
+        )
+    except Exception as exc:
+        logger.exception("Test DIM.RIA failed: %s", exc)
+        report_text = (
+            "❌ <b>Помилка під час тесту DIM.RIA!</b>\n\n"
+            f"Деталі помилки: <code>{html.escape(str(exc))}</code>"
+        )
+
+    if callback.message:
+        await callback.message.edit_text(
+            report_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+
+
+# --- СИСТЕМА ДОСТУПУ (RBAC) ТА КЕРУВАННЯ КОРИСТУВАЧАМИ ---
+
+
+@dp.callback_query(F.data.startswith("request_access:"))
+async def handle_request_access(callback: CallbackQuery) -> None:
+    """Подача запиту на доступ від неавторизованого користувача."""
+    user_id = callback.from_user.id
+    username = callback.from_user.username or ""
+    full_name = callback.from_user.full_name or ""
+
+    user = await db.get_user(user_id)
+    if user and user.get("role") == "realtor" and user.get("is_active"):
+        await callback.answer("Ви вже маєте доступ!", show_alert=True)
+        return
+
+    await db.add_user(
+        telegram_id=user_id,
+        username=username,
+        full_name=full_name,
+        role="pending",
+        is_active=False,
+    )
+    await callback.answer("📨 Запит надіслано адміністратору!", show_alert=False)
+
+    if callback.message:
+        await callback.message.edit_text(
+            "⏳ <b>Ваш запит успішно надіслано адміністраторам!</b>\n\n"
+            "Будь ласка, зачекайте на схвалення доступу. Після підтвердження вам надійде сповіщення.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # Сповіщаємо всіх адміністраторів
+    admin_notify_text = (
+        f"🔔 <b>Новий запит на доступ до RieltorBot!</b>\n\n"
+        f"• <b>Ім'я:</b> {html.escape(full_name)}\n"
+        f"• <b>Username:</b> @{html.escape(username) if username else 'немає'}\n"
+        f"• <b>Telegram ID:</b> <code>{user_id}</code>\n\n"
+        f"Оберіть рішення для цього користувача:"
+    )
+    for admin_id in settings.admin_id_list:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=admin_notify_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=access_request_admin_keyboard(user_id),
+            )
+        except Exception as err:
+            logger.warning("Failed notifying admin %d: %s", admin_id, err)
+
+
+@dp.callback_query(F.data.startswith("approve_user:"))
+async def handle_approve_user(callback: CallbackQuery) -> None:
+    """Схвалення запиту користувача адміністратором."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        target_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка ідентифікатора.", show_alert=True)
+        return
+
+    await db.set_user_role(target_id, "realtor")
+    await db.set_user_status(target_id, True)
+    await callback.answer("✅ Доступ для користувача активовано!", show_alert=False)
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"✅ <b>Користувача <code>{target_id}</code> схвалено як Ріелтора!</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+
+    # Надсилаємо сповіщення користувачеві
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text=(
+                "🎉 <b>Ваш доступ до RieltorBot схвалено!</b>\n\n"
+                "Тепер ви маєте доступ до бази перевірених квартир від власників у Дніпрі.\n"
+                "Натисніть /start для переходу до кабінету ріелтора:"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=realtor_main_keyboard(),
+        )
+    except Exception as err:
+        logger.warning("Could not notify approved user %d: %s", target_id, err)
+
+
+@dp.callback_query(F.data.startswith("reject_user:"))
+async def handle_reject_user(callback: CallbackQuery) -> None:
+    """Відхилення запиту користувача адміністратором."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        target_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка ідентифікатора.", show_alert=True)
+        return
+
+    await db.set_user_status(target_id, False)
+    await db.set_user_role(target_id, "rejected")
+    await callback.answer("❌ Запит відхилено.", show_alert=False)
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"❌ <b>Запит користувача <code>{target_id}</code> відхилено.</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_menu_keyboard(),
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text="❌ <b>Ваш запит на доступ до RieltorBot було відхилено.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as err:
+        logger.warning("Could not notify rejected user %d: %s", target_id, err)
+
+
+@dp.callback_query(F.data == "users_menu")
+async def handle_users_menu(callback: CallbackQuery) -> None:
+    """Меню списку користувачів для адміністратора."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    users = await db.list_users()
+    text = (
+        "👥 <b>Керування користувачами та доступом</b>\n\n"
+        f"Всього зареєстровано: <b>{len(users)}</b>\n\n"
+        "Оберіть користувача зі списку для перегляду та зміни прав:"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=users_menu_keyboard(users),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("user_detail:"))
+async def handle_user_detail(callback: CallbackQuery) -> None:
+    """Детальна картка користувача та керування статусом."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        target_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка ідентифікатора.", show_alert=True)
+        return
+
+    user = await db.get_user(target_id)
+    if not user:
+        await callback.answer("Користувача не знайдено.", show_alert=True)
+        return
+
+    u_name = user.get("full_name") or "Не вказано"
+    u_username = f"@{user.get('username')}" if user.get("username") else "немає"
+    u_role = user.get("role", "realtor")
+    is_act = bool(user.get("is_active", 1))
+    act_str = "🟢 Активний" if is_act else "🔴 Неактивний / Заблокований"
+    created = str(user.get("created_at") or "")[:19].replace("T", " ")
+
+    text = (
+        f"👤 <b>Картка користувача:</b>\n\n"
+        f"• <b>Telegram ID:</b> <code>{target_id}</code>\n"
+        f"• <b>Ім'я:</b> {html.escape(u_name)}\n"
+        f"• <b>Username:</b> {html.escape(u_username)}\n"
+        f"• <b>Роль:</b> <code>{u_role}</code>\n"
+        f"• <b>Статус:</b> {act_str}\n"
+        f"• <b>Зареєстровано:</b> {created}\n"
+    )
+
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_detail_keyboard(target_id, u_role, is_act),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("user_toggle_act:"))
+async def handle_user_toggle_act(callback: CallbackQuery) -> None:
+    """Перемикання активності користувача."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        target_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка ідентифікатора.", show_alert=True)
+        return
+
+    user = await db.get_user(target_id)
+    if not user:
+        await callback.answer("Користувача не знайдено.", show_alert=True)
+        return
+
+    new_act = not bool(user.get("is_active", 1))
+    await db.set_user_status(target_id, new_act)
+    status_label = "активовано 🟢" if new_act else "деактивовано 🔴"
+    await callback.answer(f"Користувача {status_label}", show_alert=False)
+
+    user["is_active"] = 1 if new_act else 0
+    u_name = user.get("full_name") or "Не вказано"
+    u_username = f"@{user.get('username')}" if user.get("username") else "немає"
+    u_role = user.get("role", "realtor")
+    act_str = "🟢 Активний" if new_act else "🔴 Неактивний / Заблокований"
+    created = str(user.get("created_at") or "")[:19].replace("T", " ")
+
+    text = (
+        f"👤 <b>Картка користувача:</b>\n\n"
+        f"• <b>Telegram ID:</b> <code>{target_id}</code>\n"
+        f"• <b>Ім'я:</b> {html.escape(u_name)}\n"
+        f"• <b>Username:</b> {html.escape(u_username)}\n"
+        f"• <b>Роль:</b> <code>{u_role}</code>\n"
+        f"• <b>Статус:</b> {act_str}\n"
+        f"• <b>Зареєстровано:</b> {created}\n"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_detail_keyboard(target_id, u_role, new_act),
+        )
+
+
+@dp.callback_query(F.data.startswith("make_admin:"))
+async def handle_make_admin(callback: CallbackQuery) -> None:
+    """Призначення користувача адміністратором."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
+    try:
+        target_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка ідентифікатора.", show_alert=True)
+        return
+
+    await db.set_user_role(target_id, "admin")
+    await callback.answer("Користувача призначено адміністратором! 👑", show_alert=True)
+
+    users = await db.list_users()
+    if callback.message:
+        await callback.message.edit_text(
+            "👥 <b>Керування користувачами та доступом</b>\n\nОберіть користувача зі списку:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=users_menu_keyboard(users),
+        )
+
+
+# --- КАБІНЕТ РІЕЛТОРА ---
+
+
+@dp.callback_query(F.data == "realtor_status")
+async def handle_realtor_status(callback: CallbackQuery) -> None:
+    """Інформація про статус та підтримку для ріелтора."""
+    text = (
+        "ℹ️ <b>Мій статус та технічна підтримка</b>\n\n"
+        "• <b>Ваш статус:</b> 🟢 Авторизований Ріелтор\n"
+        "• <b>Режим моніторингу:</b> Постійний (2–4 хвилини)\n"
+        "• <b>Джерела даних:</b> OLX.ua та DIM.RIA\n"
+        "• <b>Фільтрація:</b> 100% перевірка власників, відсікання посередників\n\n"
+        "💡 <i>Сповіщення про нові квартири надходять автоматично у цей чат.</i>\n\n"
+        "З будь-яких технічних питань звертайтеся до адміністратора системи."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_realtor_keyboard(),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "back_to_realtor")
+async def handle_back_to_realtor(callback: CallbackQuery) -> None:
+    """Повернення до головного меню Кабінету Ріелтора."""
+    full_name = callback.from_user.full_name or ""
+    text = get_realtor_menu_text(full_name)
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=realtor_main_keyboard(),
+        )
+    await callback.answer()
 
 
 # --- ПЕРЕГЛЯД ОБ'ЄКТІВ У БАЗІ (ПАГІНАЦІЯ БЕЗ ЗАСМІЧЕННЯ) ---
@@ -448,6 +1008,7 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
     currency = item.get("currency", "грн")
     district = html.escape(item.get("district") or "Не вказано")
     url = item.get("url", "")
+    source = html.escape(item.get("source", "OLX.ua"))
     created_val = str(item.get("created_time") or "")[:16].replace("T", " ")
     seen_val = str(item.get("seen_at") or "")[:16].replace("T", " ")
 
@@ -457,10 +1018,14 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
     floor = item.get("floor")
     total_floors = item.get("total_floors")
     area = item.get("total_area")
-    floor_str = f"{floor}/{total_floors} пов." if floor and total_floors else (f"{floor} пов." if floor else "-")
+    floor_str = (
+        f"{floor}/{total_floors} пов."
+        if floor and total_floors
+        else (f"{floor} пов." if floor else "-")
+    )
 
     card_text = (
-        f"📦 <b>Об'єкт #{page_index + 1} з {total} (Власник)</b>\n\n"
+        f"📦 <b>Об'єкт #{page_index + 1} з {total} ({source})</b>\n\n"
         f"🏠 <b>{safe_title}</b>\n"
         f"💰 <b>Ціна:</b> {price:,.0f} {currency}\n"
         f"📍 <b>Район:</b> {district}\n"
@@ -471,13 +1036,17 @@ async def handle_view_objects(callback: CallbackQuery) -> None:
         f"🕒 <b>Зафіксовано в базі:</b> {seen_val}\n"
     )
 
-    kb = pagination_keyboard(current_index=page_index, total_count=total, url=url)
+    is_admin = await is_user_admin(callback.from_user.id)
+    kb = pagination_keyboard(
+        current_index=page_index, total_count=total, url=url, is_admin=is_admin
+    )
 
     if callback.message:
         try:
-            await callback.message.edit_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await callback.message.edit_text(
+                card_text, parse_mode=ParseMode.HTML, reply_markup=kb
+            )
         except Exception:
-            # Якщо текст не змінився при повторному кліку
             pass
     await callback.answer()
 
@@ -517,19 +1086,26 @@ async def handle_show_feed(callback: CallbackQuery) -> None:
             )
             await asyncio.sleep(0.1)
 
+    is_admin = await is_user_admin(callback.from_user.id)
+    back_kb = back_to_menu_keyboard() if is_admin else back_to_realtor_keyboard()
+
     if callback.message:
         await callback.message.answer(
             "✅ Усі нові об'єкти вивантажено.",
-            reply_markup=back_to_menu_keyboard(),
+            reply_markup=back_kb,
         )
 
 
-# --- ЕКСПОРТ В EXCEL ---
+# --- ЕКСПОРТ В EXCEL (АДМІН) ---
 
 
 @dp.callback_query(F.data == "export_excel")
 async def handle_export_excel(callback: CallbackQuery) -> None:
     """Генерує та відправляє файл Excel з усіма об'єктами бази."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     await callback.answer("Генерую Excel файл...")
     items = await db.get_all_listings_for_export()
 
@@ -546,20 +1122,24 @@ async def handle_export_excel(callback: CallbackQuery) -> None:
             caption=(
                 f"📊 <b>Експорт успішно сформовано!</b>\n\n"
                 f"Всього об'єктів у таблиці: <b>{len(items)}</b>\n"
-                f"Файл містить повні дані: ID, назва, ціна, район, посилання та дати."
+                f"Файл містить повні дані: ID, джерело, назва, ціна, телефон, район, посилання та дати."
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=back_to_menu_keyboard(),
         )
 
 
-# --- МЕНЮ ПРОКСІ ---
+# --- МЕНЮ ПРОКСІ (АДМІН) ---
 
 
 @dp.callback_query(F.data == "proxy_menu")
 @dp.callback_query(F.data == "back_to_proxy_menu")
 async def handle_proxy_menu(callback: CallbackQuery, state: FSMContext) -> None:
     """Відображає меню керування проксі."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     await state.clear()
     text, has_proxies = await get_proxy_menu_text()
     if callback.message:
@@ -574,6 +1154,10 @@ async def handle_proxy_menu(callback: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "proxy_check_all")
 async def handle_proxy_check_all(callback: CallbackQuery) -> None:
     """Перевіряє працездатність та швидкість усіх збережених проксі."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     proxies = await db.get_all_proxies()
     if not proxies:
         await callback.answer("Немає проксі для перевірки.", show_alert=True)
@@ -605,6 +1189,10 @@ async def handle_proxy_check_all(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "proxy_add_start")
 async def handle_proxy_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Початок сценарію додавання проксі."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     await state.set_state(ProxyStates.waiting_for_proxy_url)
     text = (
         "➕ <b>Додавання нового проксі</b>\n\n"
@@ -616,7 +1204,9 @@ async def handle_proxy_add_start(callback: CallbackQuery, state: FSMContext) -> 
         "<i>Бот автоматично протестує проксі перед збереженням.</i>"
     )
     if callback.message:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=cancel_fsm_keyboard())
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=cancel_fsm_keyboard()
+        )
     await callback.answer()
 
 
@@ -640,7 +1230,6 @@ async def handle_proxy_input(message: Message, state: FSMContext) -> None:
     saved = await db.add_proxy(norm_url)
 
     if saved:
-        # Отримуємо ID щойно доданого проксі для збереження статусу
         all_proxies = await db.get_all_proxies()
         for p in all_proxies:
             if p["url"] == norm_url:
@@ -659,12 +1248,18 @@ async def handle_proxy_input(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await status_msg.delete()
-    await message.answer(result_text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+    await message.answer(
+        result_text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard()
+    )
 
 
 @dp.callback_query(F.data == "proxy_delete_menu")
 async def handle_proxy_delete_menu(callback: CallbackQuery) -> None:
     """Меню вибору проксі для видалення."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     proxies = await db.get_all_proxies()
     if not proxies:
         await callback.answer("Немає проксі для видалення.", show_alert=True)
@@ -680,6 +1275,10 @@ async def handle_proxy_delete_menu(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("proxy_del:"))
 async def handle_proxy_delete_item(callback: CallbackQuery) -> None:
     """Видалення обраного проксі."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     try:
         proxy_id = int(callback.data.split(":")[1])
     except (IndexError, ValueError):
@@ -698,46 +1297,71 @@ async def handle_proxy_delete_item(callback: CallbackQuery) -> None:
         )
 
 
-# --- НАВІГАЦІЯ: НАЗАД В ГОЛОВНЕ МЕНЮ ---
+# --- НАВІГАЦІЯ ТА СИСТЕМНИЙ СТАТУС ---
 
 
 @dp.callback_query(F.data == "back_to_main")
 async def handle_back_to_main(callback: CallbackQuery, state: FSMContext) -> None:
-    """Повернення в головне меню."""
+    """Повернення в головне меню адміністратора."""
     await state.clear()
-    is_active = await db.get_monitoring_status()
-    text = await get_main_menu_text()
+    if not await is_user_admin(callback.from_user.id):
+        full_name = callback.from_user.full_name or ""
+        text = get_realtor_menu_text(full_name)
+        if callback.message:
+            await callback.message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
+            )
+        await callback.answer()
+        return
+
+    parsers = await db.get_parsers_state()
+    kb = admin_main_keyboard(parsers.get("olx", True), parsers.get("dimria", True))
+    text = await get_admin_menu_text()
     if callback.message:
         await callback.message.edit_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(is_active),
+            reply_markup=kb,
         )
     await callback.answer()
 
 
 @dp.callback_query(F.data == "show_status")
 async def handle_show_status(callback: CallbackQuery) -> None:
-    """Показ системного статусу."""
+    """Показ детального системного статусу."""
+    if not await is_user_admin(callback.from_user.id):
+        await callback.answer("⛔️ Доступ заборонено.", show_alert=True)
+        return
+
     stats = await db.get_stats()
-    is_active = await db.get_monitoring_status()
+    parsers = await db.get_parsers_state()
+    users = await db.list_users()
+
+    olx_act = parsers.get("olx", True)
+    dimria_act = parsers.get("dimria", True)
+
     excluded_str = (
-        ", ".join(settings.excluded_districts) if settings.excluded_districts else "Усі райони"
+        ", ".join(settings.excluded_districts)
+        if settings.excluded_districts
+        else "Усі райони"
     )
 
     text = (
-        f"ℹ️ <b>Статус системи моніторингу</b>\n\n"
-        f"• <b>Фоновий парсер:</b> {'🟢 Працює' if is_active else '⏸ На паузі'}\n"
+        f"ℹ️ <b>Статус системи моніторингу RieltorBot</b>\n\n"
+        f"• <b>OLX.ua парсер:</b> {'🟢 Працює' if olx_act else '🔴 На паузі'}\n"
+        f"• <b>DIM.RIA парсер:</b> {'🟢 Працює' if dimria_act else '🔴 На паузі'}\n"
         f"• <b>Всього збережено оголошень:</b> {stats['total_seen']}\n"
         f"• <b>Надіслано сповіщень:</b> {stats['total_sent']}\n"
-        f"• <b>Активних підписників:</b> {stats['active_subscribers']}\n"
+        f"• <b>Користувачів у системі:</b> {len(users)}\n"
         f"• <b>Збережених проксі:</b> {stats['proxies_count']} (активних: {stats['active_proxies_count']})\n"
         f"• <b>Місто:</b> {settings.CITY_NAME}\n"
         f"• <b>Виключені райони:</b> {html.escape(excluded_str)}\n"
         f"• <b>Інтервал перевірки:</b> {settings.POLL_INTERVAL_SECONDS} сек.\n"
     )
     if callback.message:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard())
+        await callback.message.edit_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=back_to_menu_keyboard()
+        )
     await callback.answer()
 
 
@@ -746,17 +1370,31 @@ async def handle_show_status(callback: CallbackQuery) -> None:
 
 async def main() -> None:
     """Головна точка входу додатку."""
-    logger.info("Initializing RieltorBot MVP with Inline UI...")
+    logger.info("Initializing RieltorBot MVP with Two-Tier RBAC & Independent Parsers...")
     await db.init_db()
+
+    # Автоматично реєструємо адмінів з config у таблиці users
+    for admin_id in settings.admin_id_list:
+        await db.add_user(
+            telegram_id=admin_id,
+            username="",
+            full_name="Admin",
+            role="admin",
+            is_active=True,
+        )
 
     # Початкове заповнення бази для запобігання спаму старими оголошеннями при першому старті
     if settings.INIT_MARK_AS_SEEN:
         stats = await db.get_stats()
         if stats["total_seen"] == 0:
-            logger.info("Fresh database detected. Initializing baseline listings without sending notifications...")
+            logger.info(
+                "Fresh database detected. Initializing baseline listings without sending notifications..."
+            )
             initial_items = await olx_scraper.fetch_listings(limit=40)
             if settings.DIMRIA_ENABLED:
-                initial_dimria = await dimria_scraper.fetch_listings(limit=15, seen_checker=db.is_listing_seen)
+                initial_dimria = await dimria_scraper.fetch_listings(
+                    limit=15, seen_checker=db.is_listing_seen
+                )
                 initial_items.extend(initial_dimria)
             added, _ = await db.mark_listings_batch(initial_items, is_sent=False)
             logger.info("Baseline initialized with %d listings.", added)

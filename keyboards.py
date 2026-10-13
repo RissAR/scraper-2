@@ -2,35 +2,158 @@ from typing import Any, Sequence
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def main_menu_keyboard(is_active: bool) -> InlineKeyboardMarkup:
-    """Головне меню керування ботом на інлайн-кнопках."""
-    toggle_text = "⏸ Зупинити моніторинг" if is_active else "▶️ Запустити моніторинг"
-    toggle_data = "monitoring_pause" if is_active else "monitoring_start"
+def admin_main_keyboard(is_olx: bool, is_dimria: bool) -> InlineKeyboardMarkup:
+    """Головне меню керування ботом для Адміністратора з роздільними кнопками парсерів."""
+    btn_olx = InlineKeyboardButton(
+        text="🟢 OLX: Зупинити" if is_olx else "🔴 OLX: Запустити",
+        callback_data="toggle_olx",
+    )
+    btn_dimria = InlineKeyboardButton(
+        text="🟢 DIM.RIA: Зупинити" if is_dimria else "🔴 DIM.RIA: Запустити",
+        callback_data="toggle_dimria",
+    )
+
+    all_active = is_olx and is_dimria
+    btn_all = InlineKeyboardButton(
+        text="⏸ Зупинити ВСІ" if all_active else "🚀 Запустити ВСІ",
+        callback_data="toggle_all",
+    )
 
     keyboard = [
+        [btn_olx, btn_dimria],
+        [btn_all],
         [
-            InlineKeyboardButton(text=toggle_text, callback_data=toggle_data),
-        ],
-        [
-            InlineKeyboardButton(text="🔍 Перевірити OLX зараз", callback_data="manual_check"),
+            InlineKeyboardButton(text="🔍 Тест OLX (1 коло)", callback_data="test_olx_now"),
+            InlineKeyboardButton(text="🔍 Тест DIM.RIA (1 коло)", callback_data="test_dimria_now"),
         ],
         [
             InlineKeyboardButton(text="📦 Об'єкти в базі", callback_data="view_objects:0"),
             InlineKeyboardButton(text="📊 Експорт в Excel", callback_data="export_excel"),
         ],
         [
+            InlineKeyboardButton(text="👥 Користувачі", callback_data="users_menu"),
             InlineKeyboardButton(text="🌐 Меню проксі", callback_data="proxy_menu"),
-            InlineKeyboardButton(text="ℹ️ Статус системи", callback_data="show_status"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Системний статус", callback_data="show_status"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def back_to_menu_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка повернення в головне меню."""
+def main_menu_keyboard(is_active: bool) -> InlineKeyboardMarkup:
+    """Сумісність зі старим викликом."""
+    return admin_main_keyboard(is_active, is_active)
+
+
+def realtor_main_keyboard() -> InlineKeyboardMarkup:
+    """Головне меню Кабінету Ріелтора (чистий клієнтський інтерфейс)."""
     keyboard = [
         [
-            InlineKeyboardButton(text="◀️ Назад в головне меню", callback_data="back_to_main"),
+            InlineKeyboardButton(text="📦 Переглянути останні квартири", callback_data="view_objects:0"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Мій статус та підтримка", callback_data="realtor_status"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def unauthorized_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавіатура для неавторизованих користувачів (подача запиту на доступ)."""
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                text="📩 Надіслати запит на доступ",
+                callback_data=f"request_access:{user_id}",
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def access_request_admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавіатура адміністратора під час отримання запиту на доступ від користувача."""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="✅ Схвалити (Ріелтор)", callback_data=f"approve_user:{user_id}"),
+            InlineKeyboardButton(text="❌ Відхилити", callback_data=f"reject_user:{user_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def users_menu_keyboard(users: Sequence[dict[str, Any]]) -> InlineKeyboardMarkup:
+    """Клавіатура списку користувачів для адміністратора."""
+    keyboard = []
+    for u in users[:10]:
+        u_id = u["telegram_id"]
+        name = u.get("full_name") or u.get("username") or f"ID {u_id}"
+        role = u.get("role", "realtor")
+        is_act = bool(u.get("is_active", 1))
+
+        if role == "admin":
+            icon = "👑"
+            role_label = "Адмін"
+        elif role == "pending":
+            icon = "⏳"
+            role_label = "Очікує"
+        elif is_act:
+            icon = "🟢"
+            role_label = "Ріелтор"
+        else:
+            icon = "🔴"
+            role_label = "Деакт."
+
+        btn_text = f"{icon} {name[:16]} ({role_label})"
+        keyboard.append([
+            InlineKeyboardButton(text=btn_text, callback_data=f"user_detail:{u_id}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(text="◀️ Назад в адмін-панель", callback_data="back_to_main")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def user_detail_keyboard(user_id: int, current_role: str, is_active: bool) -> InlineKeyboardMarkup:
+    """Кнопки керування конкретним користувачем."""
+    keyboard = []
+    if current_role == "pending":
+        keyboard.append([
+            InlineKeyboardButton(text="✅ Схвалити як Ріелтора", callback_data=f"approve_user:{user_id}"),
+            InlineKeyboardButton(text="❌ Відхилити запит", callback_data=f"reject_user:{user_id}"),
+        ])
+    elif current_role != "admin":
+        toggle_text = "🔴 Деактивувати" if is_active else "🟢 Активувати"
+        keyboard.append([
+            InlineKeyboardButton(text=toggle_text, callback_data=f"user_toggle_act:{user_id}")
+        ])
+        keyboard.append([
+            InlineKeyboardButton(text="👑 Призначити Адміном", callback_data=f"make_admin:{user_id}")
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(text="◀️ До списку користувачів", callback_data="users_menu")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка повернення в головне меню адміністратора."""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="◀️ Назад в адмін-панель", callback_data="back_to_main"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def back_to_realtor_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка повернення в Кабінет Ріелтора."""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="◀️ Назад в кабінет", callback_data="back_to_realtor"),
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -61,7 +184,7 @@ def proxy_menu_keyboard(has_proxies: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Видалити проксі", callback_data="proxy_delete_menu"),
         ])
     keyboard.append([
-        InlineKeyboardButton(text="◀️ Назад в головне меню", callback_data="back_to_main"),
+        InlineKeyboardButton(text="◀️ Назад в адмін-панель", callback_data="back_to_main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -72,7 +195,6 @@ def proxy_delete_keyboard(proxies: Sequence[dict[str, Any]]) -> InlineKeyboardMa
     for p in proxies:
         p_id = p["id"]
         raw_url = p["url"]
-        # Маскуємо пароль, якщо він є
         masked = raw_url.split("@")[-1] if "@" in raw_url else raw_url
         btn_text = f"🗑️ #{p_id}: {masked[:28]}"
         keyboard.append([
@@ -86,10 +208,11 @@ def proxy_delete_keyboard(proxies: Sequence[dict[str, Any]]) -> InlineKeyboardMa
 
 
 def pagination_keyboard(
-    current_index: int, total_count: int, url: str
+    current_index: int, total_count: int, url: str, is_admin: bool = True
 ) -> InlineKeyboardMarkup:
     """
     Клавіатура компактного перегляду об'єктів у базі без засмічення стрічки.
+    Підтримує посилання як на OLX, так і на DIM.RIA.
     """
     nav_row = []
 
@@ -117,10 +240,13 @@ def pagination_keyboard(
     else:
         nav_row.append(InlineKeyboardButton(text="⛔️", callback_data="noop"))
 
+    back_callback = "back_to_main" if is_admin else "back_to_realtor"
+    back_text = "◀️ Назад в адмін-панель" if is_admin else "◀️ Назад в кабінет"
+
     keyboard = [
-        [InlineKeyboardButton(text="🔗 Відкрити на OLX", url=url)],
+        [InlineKeyboardButton(text="🔗 Відкрити оголошення", url=url)],
         nav_row,
-        [InlineKeyboardButton(text="◀️ Назад в головне меню", callback_data="back_to_main")],
+        [InlineKeyboardButton(text=back_text, callback_data=back_callback)],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 

@@ -110,7 +110,7 @@ class DatabaseManager:
                 """
             )
 
-            # Таблиця системного стану бота (наприклад, активність моніторингу)
+            # Таблиця системного стану бота (активність моніторингу та окремих парсерів)
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_state (
@@ -119,15 +119,42 @@ class DatabaseManager:
                 );
                 """
             )
-            # За замовчуванням моніторинг активний
+            # За замовчуванням парсери активні
             await db.execute(
                 "INSERT OR IGNORE INTO bot_state (key, value) VALUES ('monitoring_active', '1');"
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_state (key, value) VALUES ('olx_active', '1');"
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_state (key, value) VALUES ('dimria_active', '1');"
+            )
+
+            # Таблиця користувачів з ролями (RBAC: 'admin', 'realtor', 'pending')
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    role TEXT NOT NULL DEFAULT 'realtor',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            # Автоматична міграція існуючих підписників у таблицю users
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, is_active, created_at)
+                SELECT chat_id, username, full_name, 'realtor', is_active, created_at FROM subscribers;
+                """
             )
 
             await db.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
 
-    # --- МЕТОДИ СТАНУ БОТА ---
+    # --- МЕТОДИ СТАНУ БОТА ТА ПАРСЕРІВ ---
 
     async def get_monitoring_status(self) -> bool:
         """Повертає True, якщо фоновий парсер запущено, і False, якщо на паузі."""
@@ -138,7 +165,7 @@ class DatabaseManager:
                 return row[0] == "1" if row else True
 
     async def set_monitoring_status(self, is_active: bool) -> None:
-        """Оновлює стан фонового парсера."""
+        """Оновлює глобальний стан фонового парсера."""
         sql = """
         INSERT INTO bot_state (key, value) VALUES ('monitoring_active', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value;
@@ -146,6 +173,45 @@ class DatabaseManager:
         val_str = "1" if is_active else "0"
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(sql, (val_str,))
+            await db.commit()
+
+    async def get_parsers_state(self) -> dict[str, bool]:
+        """Повертає словник станів парсерів: {'olx': bool, 'dimria': bool}."""
+        sql = "SELECT key, value FROM bot_state WHERE key IN ('olx_active', 'dimria_active');"
+        res = {"olx": True, "dimria": True}
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql) as cur:
+                rows = await cur.fetchall()
+                for k, v in rows:
+                    if k == "olx_active":
+                        res["olx"] = (v == "1")
+                    elif k == "dimria_active":
+                        res["dimria"] = (v == "1")
+        return res
+
+    async def set_parser_state(self, parser_name: str, is_active: bool) -> None:
+        """Встановлює стан конкретного парсера ('olx' або 'dimria')."""
+        key = f"{parser_name.lower()}_active"
+        sql = """
+        INSERT INTO bot_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        val_str = "1" if is_active else "0"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, (key, val_str))
+            await db.commit()
+
+    async def set_all_parsers_state(self, is_active: bool) -> None:
+        """Встановлює стан для всіх парсерів одночасно."""
+        val_str = "1" if is_active else "0"
+        sql = """
+        INSERT INTO bot_state (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, ("olx_active", val_str))
+            await db.execute(sql, ("dimria_active", val_str))
+            await db.execute(sql, ("monitoring_active", val_str))
             await db.commit()
 
     # --- МЕТОДИ РОБОТИ З ОГОЛОШЕННЯМИ ---
@@ -345,6 +411,103 @@ class DatabaseManager:
             async with db.execute(sql) as cursor:
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
+
+    # --- МЕТОДИ КОРИСТУВАЧІВ ТА РОЛЕЙ (RBAC) ---
+
+    async def get_user(self, telegram_id: int) -> Optional[dict]:
+        """Отримує профіль користувача за його telegram_id."""
+        sql = "SELECT * FROM users WHERE telegram_id = ? LIMIT 1;"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, (telegram_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def get_user_role(self, telegram_id: int) -> Optional[str]:
+        """
+        Повертає роль користувача ('admin', 'realtor', 'pending') або 'deactivated'.
+        Якщо користувач не знайдений — повертає None.
+        """
+        sql = "SELECT role, is_active FROM users WHERE telegram_id = ? LIMIT 1;"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, (telegram_id,)) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                if row[1] == 0:
+                    return "deactivated"
+                return str(row[0])
+
+    async def add_user(
+        self,
+        telegram_id: int,
+        username: str = "",
+        full_name: str = "",
+        role: str = "realtor",
+        is_active: bool = True,
+    ) -> bool:
+        """Додає або оновлює користувача з відповідною роллю."""
+        sql = """
+        INSERT INTO users (telegram_id, username, full_name, role, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username = excluded.username,
+            full_name = excluded.full_name,
+            role = excluded.role,
+            is_active = excluded.is_active;
+        """
+        now_str = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                sql,
+                (telegram_id, username, full_name, role, 1 if is_active else 0, now_str),
+            )
+            # Синхронізуємо зі subscribers для зворотної сумісності
+            await db.execute(
+                """
+                INSERT INTO subscribers (chat_id, username, full_name, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name,
+                    is_active = excluded.is_active;
+                """,
+                (telegram_id, username, full_name, 1 if is_active else 0, now_str),
+            )
+            await db.commit()
+            return True
+
+    async def list_users(self) -> list[dict]:
+        """Повертає список усіх зареєстрованих користувачів."""
+        sql = "SELECT * FROM users ORDER BY created_at DESC;"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def set_user_role(self, telegram_id: int, role: str) -> None:
+        """Змінює роль користувача."""
+        sql = "UPDATE users SET role = ? WHERE telegram_id = ?;"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(sql, (role, telegram_id))
+            await db.commit()
+
+    async def set_user_status(self, telegram_id: int, is_active: bool) -> None:
+        """Змінює статус активності користувача."""
+        val = 1 if is_active else 0
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE users SET is_active = ? WHERE telegram_id = ?;", (val, telegram_id))
+            await db.execute("UPDATE subscribers SET is_active = ? WHERE chat_id = ?;", (val, telegram_id))
+            await db.commit()
+
+    async def get_active_recipients(self) -> list[int]:
+        """Повертає список ID користувачів зі статусом active та роллю 'admin' або 'realtor'."""
+        sql = "SELECT telegram_id FROM users WHERE is_active = 1 AND role IN ('admin', 'realtor');"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql) as cur:
+                rows = await cur.fetchall()
+                return [r[0] for r in rows]
 
     # --- МЕТОДИ КЕРУВАННЯ ПРОКСІ ---
 

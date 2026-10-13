@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # Telegram Bot
     BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""  # ID абонента/каналу (можна декілька через кому)
+    ADMIN_IDS: str = ""  # Список Telegram ID адміністраторів через кому
 
     # Інтервал перевірки (у секундах, за ТЗ 2-4 хв = 120-240 с)
     POLL_INTERVAL_SECONDS: int = 180
@@ -75,6 +76,26 @@ class Settings(BaseSettings):
             except ValueError:
                 pass
         return ids
+
+    @property
+    def admin_id_list(self) -> list[int]:
+        """Повертає список числових ID адміністраторів із ADMIN_IDS (або fallback на TELEGRAM_CHAT_ID)."""
+        ids: list[int] = []
+        if self.ADMIN_IDS and self.ADMIN_IDS.strip():
+            for raw_id in self.ADMIN_IDS.split(","):
+                raw_id = raw_id.strip()
+                if raw_id:
+                    try:
+                        ids.append(int(raw_id))
+                    except ValueError:
+                        pass
+        if not ids and self.target_chat_ids:
+            return self.target_chat_ids
+        return ids
+
+    def is_admin(self, user_id: int) -> bool:
+        """Перевіряє, чи є користувач адміністратором за конфігурацією."""
+        return user_id in self.admin_id_list
 
 
 settings = Settings()
