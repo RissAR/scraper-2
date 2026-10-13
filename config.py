@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Опціональний токен авторизації OLX для витягування захищених номерів
     OLX_BEARER_TOKEN: Optional[str] = None
 
+    # Налаштування DIM.RIA (dom.ria.com)
+    DIMRIA_ENABLED: bool = True
+    DIMRIA_STATE_ID: int = 11  # Дніпропетровська область
+    DIMRIA_CITY_ID: int = 11   # м. Дніпро
+
     # Чи позначати поточні оголошення прочитаними при першому старті (щоб уникнути спаму)
     INIT_MARK_AS_SEEN: bool = True
 

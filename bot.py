@@ -25,6 +25,7 @@ from keyboards import (
     proxy_delete_keyboard,
     proxy_menu_keyboard,
 )
+from dimria_scraper import DimRiaScraper
 from models import ListingItem
 from olx_scraper import OLXScraper
 from proxy_checker import check_proxy_health
@@ -43,7 +44,9 @@ logger = logging.getLogger("rieltor_bot")
 bot = Bot(token=settings.BOT_TOKEN)
 dp = Dispatcher()
 db = DatabaseManager()
-scraper = OLXScraper()
+olx_scraper = OLXScraper()
+dimria_scraper = DimRiaScraper()
+scraper = olx_scraper
 
 
 class ProxyStates(StatesGroup):
@@ -116,7 +119,7 @@ def format_dict_listing_message(item: dict) -> str:
     source = html.escape(item.get("source", "OLX.ua"))
     author = html.escape(item.get("author_name") or "Власник")
     ads_cnt = item.get("author_ads_count", 1)
-    phone = html.escape(item.get("phone") or "В описі / чаті OLX")
+    phone = html.escape(item.get("phone") or f"В описі / чаті {source}")
 
     floor = item.get("floor")
     total_floors = item.get("total_floors")
@@ -165,7 +168,7 @@ async def send_listing_card(chat_id: int, item: ListingItem) -> bool:
 
 async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -> int:
     """
-    Один цикл перевірки наявності нових оголошень на OLX.ua.
+    Один цикл перевірки наявності нових оголошень на OLX.ua та DIM.RIA.
     При знаходженні нових об'єктів надсилає сповіщення з кнопкою 'Показати об'єкти'.
     """
     is_active = await db.get_monitoring_status()
@@ -173,29 +176,49 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
         logger.debug("Monitoring is paused. Skipping scheduled check.")
         return 0
 
-    logger.info("Starting OLX check cycle...")
+    sources_str = "OLX.ua + DIM.RIA" if settings.DIMRIA_ENABLED else "OLX.ua"
+    logger.info("Starting check cycle (%s)...", sources_str)
 
     # Отримуємо робочий проксі за наявності
     working_proxies = await db.get_working_proxies()
     active_proxy = random.choice(working_proxies) if working_proxies else None
 
-    try:
-        items = await scraper.fetch_listings(proxy=active_proxy)
-    except Exception as exc:
-        logger.error("Scraper encountered an exception: %s", exc)
-        return 0
+    collected_items: list[ListingItem] = []
 
-    if not items:
-        logger.info("No items retrieved from OLX.")
+    # 1. Опитування OLX.ua
+    try:
+        olx_items = await olx_scraper.fetch_listings(proxy=active_proxy)
+        collected_items.extend(olx_items)
+    except Exception as exc:
+        logger.error("OLX Scraper encountered an exception: %s", exc)
+
+    # 2. Опитування DIM.RIA
+    if settings.DIMRIA_ENABLED:
+        try:
+            dimria_items = await dimria_scraper.fetch_listings(
+                proxy=active_proxy,
+                seen_checker=db.is_listing_seen,
+            )
+            collected_items.extend(dimria_items)
+        except Exception as exc:
+            logger.error("DIM.RIA Scraper encountered an exception: %s", exc)
+
+    if not collected_items:
+        logger.info("No items retrieved in current cycle.")
         return 0
 
     new_items: list[ListingItem] = []
 
-    for item in reversed(items):
+    for item in reversed(collected_items):
         if await db.is_listing_seen(item.id):
             continue
 
-        if not scraper.is_genuinely_new(item):
+        is_new = (
+            dimria_scraper.is_genuinely_new(item)
+            if item.source == "DIM.RIA"
+            else olx_scraper.is_genuinely_new(item)
+        )
+        if not is_new:
             await db.mark_listing_seen(item, is_sent=False)
             continue
 
@@ -237,8 +260,9 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
 
 
 async def periodic_scanner_loop() -> None:
-    """Фонова задача періодичного опитування OLX у реальному часі."""
-    logger.info("Background scanner loop initialized (interval: %d s).", settings.POLL_INTERVAL_SECONDS)
+    """Фонова задача періодичного опитування OLX та DIM.RIA у реальному часі."""
+    sources_str = "OLX.ua + DIM.RIA" if settings.DIMRIA_ENABLED else "OLX.ua"
+    logger.info("Background scanner loop initialized (interval: %d s, sources: %s).", settings.POLL_INTERVAL_SECONDS, sources_str)
     while True:
         try:
             await check_for_new_listings()
@@ -730,7 +754,10 @@ async def main() -> None:
         stats = await db.get_stats()
         if stats["total_seen"] == 0:
             logger.info("Fresh database detected. Initializing baseline listings without sending notifications...")
-            initial_items = await scraper.fetch_listings(limit=40)
+            initial_items = await olx_scraper.fetch_listings(limit=40)
+            if settings.DIMRIA_ENABLED:
+                initial_dimria = await dimria_scraper.fetch_listings(limit=15, seen_checker=db.is_listing_seen)
+                initial_items.extend(initial_dimria)
             added, _ = await db.mark_listings_batch(initial_items, is_sent=False)
             logger.info("Baseline initialized with %d listings.", added)
 
