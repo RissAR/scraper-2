@@ -3,8 +3,10 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
+from playwright.async_api import async_playwright
 
 from config import settings
 from models import ListingItem
@@ -148,27 +150,236 @@ class OLXScraper:
         return {}
 
     async def fetch_offer_phone(
-        self, client: httpx.AsyncClient, offer_id: str
+        self,
+        offer_url: Any,
+        offer_id: Optional[str] = None,
+        proxy: Optional[str] = None,
+        timeout_ms: int = 15000,
     ) -> Optional[str]:
-        """Запитує номер телефону через limited-phones API (якщо доступно)."""
-        url = f"{self.API_URL}{offer_id}/limited-phones/"
+        """
+        On-Demand Playwright екстрактор для витягування номера телефону власника:
+        1. Відкриває сторінку знайденого власника через headless Chromium.
+        2. Блокує важкі медіа-ресурси (зображення, медіа, шрифти, стилі) для максимальної швидкості та економії пам'яті.
+        3. Безпечно знаходить та клікає кнопку 'Показати номер' / 'Показати телефон' з перевіркою видимості.
+        4. Перехоплює відповідь limited-phones API або зчитує номер безпосередньо з DOM (tel: лінки / контейнер).
+        """
+        # Обробка виклику зі старим форматом або посиланням
+        target_url = str(offer_url) if isinstance(offer_url, str) and offer_url.startswith("http") else None
+        if not target_url and offer_id:
+            target_url = f"https://www.olx.ua/d/uk/obyavlenie/-ID{offer_id}.html"
+
+        if not target_url:
+            return None
+
+        def _normalize(phone_str: str) -> Optional[str]:
+            digits = re.sub(r"\D", "", phone_str)
+            if digits.startswith("380") and len(digits) == 12:
+                return f"+{digits[:2]} ({digits[2:5]}) {digits[5:8]}-{digits[8:10]}-{digits[10:]}"
+            if digits.startswith("0") and len(digits) == 10:
+                return f"+38 ({digits[:3]}) {digits[3:6]}-{digits[6:8]}-{digits[8:]}"
+            if len(digits) >= 9:
+                return f"+{digits}" if not phone_str.startswith("+") else phone_str
+            return None
+
+        extracted_phone: Optional[str] = None
+
         try:
-            resp = await client.get(url, headers=self.headers, timeout=self.timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                phones = data.get("data", {}).get("phones", [])
-                if phones:
-                    # Нормалізуємо перший номер
-                    raw_phone = str(phones[0])
-                    digits = re.sub(r"\D", "", raw_phone)
-                    if digits.startswith("380") and len(digits) == 12:
-                        return f"+{digits[:2]} ({digits[2:5]}) {digits[5:8]}-{digits[8:10]}-{digits[10:]}"
-                    if digits.startswith("0") and len(digits) == 10:
-                        return f"+38 ({digits[:3]}) {digits[3:6]}-{digits[6:8]}-{digits[8:]}"
-                    return raw_phone
-        except Exception:
-            pass
-        return None
+            async with async_playwright() as p:
+                launch_kwargs: dict[str, Any] = {
+                    "headless": True,
+                    "args": [
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                    "ignore_default_args": ["--enable-automation"],
+                }
+
+                # Підтримка активного проксі
+                active_proxy = proxy or self.proxy
+                if active_proxy:
+                    try:
+                        parsed_proxy = urlparse(active_proxy)
+                        proxy_dict: dict[str, str] = {
+                            "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
+                        }
+                        if parsed_proxy.username:
+                            proxy_dict["username"] = parsed_proxy.username
+                        if parsed_proxy.password:
+                            proxy_dict["password"] = parsed_proxy.password
+                        launch_kwargs["proxy"] = proxy_dict
+                    except Exception as p_err:
+                        logger.warning("Failed parsing proxy for Playwright: %s", p_err)
+
+                browser = await p.chromium.launch(**launch_kwargs)
+                try:
+                    extra_headers = {
+                        "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"Linux"',
+                    }
+                    if settings.OLX_BEARER_TOKEN:
+                        extra_headers["Authorization"] = f"Bearer {settings.OLX_BEARER_TOKEN.strip()}"
+
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                        ),
+                        locale="uk-UA",
+                        viewport={"width": 1280, "height": 800},
+                        extra_http_headers=extra_headers,
+                    )
+
+                    page = await context.new_page()
+
+                    # Маскування автоматизації
+                    try:
+                        await page.add_init_script("""
+                            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                            window.navigator.chrome = { runtime: {} };
+                        """)
+                    except Exception:
+                        pass
+
+                    # Блокування важких ресурсів: media, image, font, stylesheet
+                    async def block_media_routes(route):
+                        try:
+                            if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+                                await route.abort()
+                            else:
+                                await route.continue_()
+                        except Exception:
+                            pass
+
+                    await page.route("**/*", block_media_routes)
+
+                    # Перехоплення limited-phones через network response
+                    async def handle_response(response):
+                        nonlocal extracted_phone
+                        if "limited-phones" in response.url:
+                            try:
+                                data = await response.json()
+                                phones = data.get("data", {}).get("phones", [])
+                                if not phones and isinstance(data.get("phones"), list):
+                                    phones = data.get("phones")
+                                if phones:
+                                    for raw_p in phones:
+                                        norm = _normalize(str(raw_p))
+                                        if norm:
+                                            extracted_phone = norm
+                                            logger.info("Successfully intercepted phone from limited-phones API: %s", norm)
+                                            break
+                            except Exception as json_err:
+                                logger.debug("Failed parsing limited-phones JSON: %s", json_err)
+
+                    page.on("response", handle_response)
+
+                    # Безпечне відкриття сторінки
+                    try:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    except Exception as nav_err:
+                        logger.debug("Navigation timeout/warning for %s: %s", target_url, nav_err)
+
+                    # Безпечне закриття cookie-банера, якщо присутній
+                    try:
+                        cookie_btn = page.locator(
+                            'button[data-testid="accept-cookies"], button#onetrust-accept-btn-handler, button:has-text("Прийняти")'
+                        ).first
+                        if await cookie_btn.is_visible(timeout=1000):
+                            await cookie_btn.click(timeout=1000)
+                    except Exception:
+                        pass
+
+                    # Безпечний пошук кнопки розкриття телефону
+                    button_selectors = [
+                        'button[data-testid="show-phone"]',
+                        'button[data-testid="show-phone-button"]',
+                        'button[data-cy="ad-contact-phone"]',
+                        '[data-testid="phones-container"] button',
+                        'button:has-text("Показати")',
+                        'button:has-text("Показать")',
+                    ]
+
+                    phone_btn = None
+                    for sel in button_selectors:
+                        try:
+                            loc = page.locator(sel)
+                            cnt = await loc.count()
+                            for i in range(cnt):
+                                candidate = loc.nth(i)
+                                if await candidate.is_visible(timeout=500):
+                                    phone_btn = candidate
+                                    break
+                            if phone_btn:
+                                break
+                        except Exception:
+                            continue
+
+                    # Безпечний клік по кнопці з багаторівневим fallback
+                    if phone_btn:
+                        try:
+                            await phone_btn.scroll_into_view_if_needed(timeout=1500)
+                            await phone_btn.click(timeout=3000)
+                            logger.debug("Clicked show phone button")
+                        except Exception as click_err:
+                            logger.debug("Direct click failed, attempting fallback force click: %s", click_err)
+                            try:
+                                await phone_btn.click(force=True, timeout=2000)
+                            except Exception:
+                                try:
+                                    await phone_btn.dispatch_event("click")
+                                except Exception:
+                                    pass
+
+                    # Очікування на оновлення відповіді мережі
+                    for _ in range(6):
+                        if extracted_phone:
+                            break
+                        await asyncio.sleep(0.5)
+
+                    # Fallback 1: Перевірка DOM на появу лінків a[href^="tel:"]
+                    if not extracted_phone:
+                        try:
+                            tel_links = page.locator('a[href^="tel:"]')
+                            tel_count = await tel_links.count()
+                            for i in range(tel_count):
+                                href = await tel_links.nth(i).get_attribute("href")
+                                if href:
+                                    clean_href = href.replace("tel:", "").strip()
+                                    norm = _normalize(clean_href)
+                                    if norm:
+                                        extracted_phone = norm
+                                        logger.info("Found phone via DOM tel: link: %s", norm)
+                                        break
+                        except Exception as dom_err:
+                            logger.debug("Error checking tel: links in DOM: %s", dom_err)
+
+                    # Fallback 2: Перевірка тексту контейнера контактів
+                    if not extracted_phone:
+                        try:
+                            container = page.locator('[data-testid="phones-container"], [data-testid="show-phone"]')
+                            c_count = await container.count()
+                            for i in range(c_count):
+                                text = await container.nth(i).inner_text()
+                                if text and "xxx" not in text.lower():
+                                    found = self._extract_phone_from_text(text)
+                                    if found:
+                                        extracted_phone = found
+                                        logger.info("Found phone via DOM container text: %s", found)
+                                        break
+                        except Exception as c_err:
+                            logger.debug("Error checking container text: %s", c_err)
+
+                finally:
+                    await browser.close()
+
+        except Exception as exc:
+            logger.warning("Playwright on-demand phone extraction failed for %s: %s", target_url, exc)
+
+        return extracted_phone
 
     def _parse_params(self, params_list: list) -> dict[str, Any]:
         """Парсить параметри квартири з сирого списку params."""
@@ -191,6 +402,7 @@ class OLXScraper:
         self,
         client: httpx.AsyncClient,
         raw: dict[str, Any],
+        proxy: Optional[str] = None,
     ) -> Optional[ListingItem]:
         """
         Повний багатошаровий парсинг оголошення:
@@ -332,12 +544,17 @@ class OLXScraper:
             image_url = photos[0]
 
         # --- КРОК 8: Витягування номера телефону ---
-        # Спочатку перевіряємо API
-        phone = await self.fetch_offer_phone(client, external_id)
-        # Якщо API не надало телефон — парсимо регулярними виразами з опису / імені / заголовка
-        if not phone:
-            combined_text = f"{title} {user_name} {description}"
-            phone = self._extract_phone_from_text(combined_text)
+        # 1. Спочатку перевіряємо, чи вказано відкритий номер у тексті (опис, заголовок, ім'я)
+        combined_text = f"{title} {user_name} {description}"
+        phone = self._extract_phone_from_text(combined_text)
+
+        # 2. Якщо в тексті немає телефону — запускаємо On-Demand Playwright екстрактор
+        if not phone and url:
+            phone = await self.fetch_offer_phone(
+                offer_url=url,
+                offer_id=external_id,
+                proxy=proxy,
+            )
 
         # --- КРОК 9: Параметри квартири ---
         floor = parsed_params.get("floor")
@@ -468,7 +685,7 @@ class OLXScraper:
                         items: list[ListingItem] = []
                         for raw in raw_items:
                             if isinstance(raw, dict):
-                                item = await self._parse_item_full(client, raw)
+                                item = await self._parse_item_full(client, raw, proxy=active_proxy)
                                 if item:
                                     items.append(item)
                                     # Коротка пауза між запитами деталей для уникнення RateLimit

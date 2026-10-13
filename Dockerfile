@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Копіюємо файл залежностей та встановлюємо їх
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install chromium --with-deps
 
 # Копіюємо вихідний код проекту
 COPY . .
