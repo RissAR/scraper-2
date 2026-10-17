@@ -348,8 +348,8 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
                 for wp in working_proxies:
                     if wp not in candidate_proxies:
                         candidate_proxies.append(wp)
-            if not candidate_proxies:
-                candidate_proxies = [None]
+            if None not in candidate_proxies:
+                candidate_proxies.append(None)
 
             last_olx_err = None
             for p_candidate in candidate_proxies:
@@ -395,8 +395,8 @@ async def check_for_new_listings(manual_trigger_chat_id: Optional[int] = None) -
                 for wp in working_proxies:
                     if wp not in candidate_proxies:
                         candidate_proxies.append(wp)
-            if not candidate_proxies:
-                candidate_proxies = [None]
+            if None not in candidate_proxies:
+                candidate_proxies.append(None)
 
             last_dimria_err = None
             for p_candidate in candidate_proxies:
@@ -804,11 +804,31 @@ async def handle_test_olx_now(callback: CallbackQuery) -> None:
             "<i>Парсер готовий до автоматичної роботи.</i>"
         )
     except Exception as exc:
-        logger.exception("Test OLX failed: %s", exc)
-        report_text = (
-            "❌ <b>Помилка під час тесту OLX.ua!</b>\n\n"
-            f"Деталі помилки: <code>{html.escape(str(exc))}</code>"
-        )
+        logger.exception("Test OLX failed with proxy: %s", exc)
+        if active_proxy:
+            try:
+                fallback_items = await olx_scraper.fetch_listings(proxy=None, limit=20)
+                new_count = 0
+                for it in fallback_items:
+                    if not await db.is_listing_seen(it.id):
+                        new_count += 1
+                report_text = (
+                    "⚠️ <b>Результати тесту OLX.ua (Fallback на пряме з'єднання):</b>\n\n"
+                    f"• Проксі <code>{html.escape(mask_proxy(active_proxy))}</code>: ❌ <b>Помилка</b> ({html.escape(str(exc))})\n"
+                    f"• Пряме з'єднання: 🟢 <b>Успішно</b> (знайдено: <b>{len(fallback_items)}</b>, нових: <b>{new_count}</b>)\n\n"
+                    "<i>Порада: проксі не зміг отримати дані з OLX, але бот успішно переключився на пряме з'єднання.</i>"
+                )
+            except Exception as direct_exc:
+                report_text = (
+                    "❌ <b>Помилка під час тесту OLX.ua!</b>\n\n"
+                    f"• Проксі (<code>{html.escape(mask_proxy(active_proxy))}</code>): <code>{html.escape(str(exc))}</code>\n"
+                    f"• Пряме з'єднання: <code>{html.escape(str(direct_exc))}</code>"
+                )
+        else:
+            report_text = (
+                "❌ <b>Помилка під час тесту OLX.ua!</b>\n\n"
+                f"Деталі помилки: <code>{html.escape(str(exc))}</code>"
+            )
 
     if callback.message:
         await callback.message.edit_text(
@@ -1657,9 +1677,15 @@ async def handle_back_to_main(callback: CallbackQuery, state: FSMContext) -> Non
         full_name = callback.from_user.full_name or ""
         text = get_realtor_menu_text(full_name)
         if callback.message:
-            await callback.message.edit_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
-            )
+            try:
+                await callback.message.edit_text(
+                    text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
+                )
+            except Exception:
+                await callback.message.delete()
+                await callback.message.answer(
+                    text, parse_mode=ParseMode.HTML, reply_markup=realtor_main_keyboard()
+                )
         await callback.answer()
         return
 
@@ -1667,11 +1693,19 @@ async def handle_back_to_main(callback: CallbackQuery, state: FSMContext) -> Non
     kb = admin_main_keyboard(parsers.get("olx", True), parsers.get("dimria", True))
     text = await get_admin_menu_text()
     if callback.message:
-        await callback.message.edit_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
+        try:
+            await callback.message.edit_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+        except Exception:
+            await callback.message.delete()
+            await callback.message.answer(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
     await callback.answer()
 
 

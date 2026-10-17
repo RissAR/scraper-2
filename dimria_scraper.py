@@ -145,10 +145,10 @@ class DimRiaScraper:
                     return ids
             else:
                 logger.warning("DIM.RIA searchEngine HTTP %d: %s", resp.status_code, resp.text[:200])
+                raise RuntimeError(f"DIM.RIA searchEngine returned HTTP {resp.status_code}")
         except Exception as exc:
             logger.error("Failed fetching IDs from DIM.RIA searchEngine: %s", exc)
-
-        return []
+            raise RuntimeError(f"DIM.RIA searchEngine failed: {exc}")
 
     async def fetch_listing_details_playwright(
         self,
@@ -488,9 +488,13 @@ class DimRiaScraper:
         }
         if active_proxy:
             client_kwargs["proxy"] = active_proxy
+            client_kwargs["verify"] = False
+            use_http2 = False
+        else:
+            use_http2 = True
 
         try:
-            client = httpx.AsyncClient(http2=True, **client_kwargs)
+            client = httpx.AsyncClient(http2=use_http2, **client_kwargs)
         except Exception:
             client = httpx.AsyncClient(**client_kwargs)
 
@@ -544,7 +548,10 @@ class DimRiaScraper:
                 }
                 if active_proxy:
                     try:
-                        p_parsed = urlparse(active_proxy)
+                        p_to_parse = active_proxy
+                        if not (p_to_parse.startswith("http://") or p_to_parse.startswith("https://") or p_to_parse.startswith("socks5://")):
+                            p_to_parse = f"http://{p_to_parse}"
+                        p_parsed = urlparse(p_to_parse)
                         p_dict: dict[str, str] = {
                             "server": f"{p_parsed.scheme}://{p_parsed.hostname}:{p_parsed.port}"
                         }

@@ -33,6 +33,18 @@ REALTOR_HARD_TRIGGERS = [
 ]
 
 
+def _mask_proxy_str(proxy_url: Optional[str]) -> str:
+    """Маскує облікові дані в URL проксі для безпечного логування."""
+    if not proxy_url:
+        return "None"
+    url = str(proxy_url)
+    if "@" in url:
+        prefix, host_part = url.split("@", 1)
+        scheme = prefix.split("://")[0] + "://" if "://" in prefix else ""
+        return f"{scheme}***:***@{host_part}"
+    return url
+
+
 class OLXScraper:
     """
     Повноцінний асинхронний скрапер OLX.ua з розширеним функціоналом:
@@ -181,7 +193,7 @@ class OLXScraper:
                 return f"+{digits}" if not phone_str.startswith("+") else phone_str
             return None
 
-        async def _extract_phone_playwright() -> Optional[str]:
+        async def _extract_phone_playwright(use_proxy: bool = True) -> Optional[str]:
             extracted_phone: Optional[str] = None
             browser = None
             context = None
@@ -202,10 +214,13 @@ class OLXScraper:
                     }
 
                     # Підтримка активного проксі
-                    active_proxy = proxy or self.proxy
+                    active_proxy = (proxy or self.proxy) if use_proxy else None
                     if active_proxy:
                         try:
-                            parsed_proxy = urlparse(active_proxy)
+                            proxy_to_parse = active_proxy
+                            if not (proxy_to_parse.startswith("http://") or proxy_to_parse.startswith("https://") or proxy_to_parse.startswith("socks5://")):
+                                proxy_to_parse = f"http://{proxy_to_parse}"
+                            parsed_proxy = urlparse(proxy_to_parse)
                             proxy_dict: dict[str, str] = {
                                 "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}"
                             }
@@ -465,14 +480,25 @@ class OLXScraper:
             return extracted_phone
 
         # Watchdog: таймаут 25с на виконання екстракції Playwright
+        has_proxy = bool(proxy or self.proxy)
         try:
-            return await asyncio.wait_for(_extract_phone_playwright(), timeout=25.0)
+            phone_result = await asyncio.wait_for(_extract_phone_playwright(use_proxy=True), timeout=25.0)
+            if phone_result:
+                return phone_result
         except asyncio.TimeoutError:
             logger.warning("Watchdog: Playwright phone extraction timed out after 25s for %s", target_url)
-            return None
         except Exception as exc:
             logger.warning("Watchdog caught unexpected error for %s: %s", target_url, exc)
-            return None
+
+        # Якщо з проксі не вдалося отримати номер, пробуємо пряме підключення як fallback
+        if has_proxy:
+            try:
+                logger.info("Retrying Playwright phone extraction via direct connection for %s", target_url)
+                return await asyncio.wait_for(_extract_phone_playwright(use_proxy=False), timeout=20.0)
+            except Exception as direct_exc:
+                logger.debug("Direct Playwright fallback failed for %s: %s", target_url, direct_exc)
+
+        return None
 
     def _parse_params(self, params_list: list) -> dict[str, Any]:
         """Парсить параметри квартири з сирого списку params."""
@@ -762,20 +788,23 @@ class OLXScraper:
         active_proxy = proxy or self.proxy
         if active_proxy:
             client_kwargs["proxy"] = active_proxy
+            client_kwargs["verify"] = False
+            use_http2 = False
+        else:
+            use_http2 = True
+
+        last_error: Optional[str] = None
+        last_status: Optional[int] = None
 
         for attempt in range(1, max_retries + 1):
             try:
-                try:
-                    client = httpx.AsyncClient(http2=True, **client_kwargs)
-                except Exception:
-                    client = httpx.AsyncClient(**client_kwargs)
-
-                async with client:
+                async with httpx.AsyncClient(http2=use_http2, **client_kwargs) as client:
                     response = await client.get(
                         self.API_URL,
                         params=params,
                         headers=self.headers,
                     )
+                    last_status = response.status_code
 
                     if response.status_code == 200:
                         data = response.json()
@@ -799,21 +828,39 @@ class OLXScraper:
                         return items
 
                     logger.warning(
-                        "OLX API returned HTTP %d on attempt %d/%d",
+                        "OLX API returned HTTP %d on attempt %d/%d (proxy: %s)",
                         response.status_code,
                         attempt,
                         max_retries,
+                        _mask_proxy_str(active_proxy),
                     )
+                    if response.status_code in (403, 429):
+                        last_error = f"HTTP {response.status_code} (Заблоковано або RateLimited OLX)"
+                        break
+                    else:
+                        last_error = f"HTTP {response.status_code}"
+
             except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
-                    "Network error on attempt %d/%d for OLX API: %s",
+                    "Network error on attempt %d/%d for OLX API (proxy: %s): %s",
                     attempt,
                     max_retries,
+                    _mask_proxy_str(active_proxy),
                     exc,
                 )
+                if use_http2:
+                    use_http2 = False
 
             if attempt < max_retries:
-                await asyncio.sleep(2.0 * attempt)
+                await asyncio.sleep(1.5 * attempt)
 
-        logger.error("Failed to fetch listings from OLX API after %d attempts", max_retries)
-        return []
+        proxy_info = _mask_proxy_str(active_proxy) if active_proxy else "Direct"
+        error_detail = last_error or (f"HTTP {last_status}" if last_status else "Невідома помилка")
+        logger.error(
+            "Failed to fetch listings from OLX API after %d attempts (proxy: %s): %s",
+            max_retries,
+            proxy_info,
+            error_detail,
+        )
+        raise RuntimeError(f"OLX API request failed ({proxy_info}): {error_detail}")
