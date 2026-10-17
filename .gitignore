@@ -4,6 +4,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 data/*.db
+data/*.db-*
 data/*.sqlite
+data/*.sqlite-*
 *.log
 .env
+.env.*
+!.env.example
+presentation/

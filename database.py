@@ -154,14 +154,16 @@ class DatabaseManager:
                 """
             )
 
-            # Гарантоване призначення прав Адміністратора за ТЗ
-            await db.execute(
-                """
-                INSERT INTO users (telegram_id, username, full_name, role, is_active, created_at)
-                VALUES (123456789, 'admin', 'Admin', 'admin', 1, datetime('now'))
-                ON CONFLICT(telegram_id) DO UPDATE SET role = 'admin', is_active = 1;
-                """
-            )
+            # Автоматична ініціалізація адміністраторів із конфігурації (.env -> ADMIN_IDS)
+            for admin_id in settings.admin_id_list:
+                await db.execute(
+                    """
+                    INSERT INTO users (telegram_id, username, full_name, role, is_active, created_at)
+                    VALUES (?, '', 'Admin', 'admin', 1, datetime('now'))
+                    ON CONFLICT(telegram_id) DO UPDATE SET role = 'admin', is_active = 1;
+                    """,
+                    (admin_id,),
+                )
 
             await db.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
